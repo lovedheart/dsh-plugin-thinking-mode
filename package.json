@@ -2,8 +2,18 @@
   "name": "dsh-plugin-thinking-mode",
   "description": "DeepSeek Harness plugin: per-request thinking-mode switch (enable_thinking) for Qwen3-family models on OpenAI-compatible endpoints",
   "version": "0.1.0",
+  "private": false,
   "type": "module",
   "main": "lib/index.js",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/lovedheart/dsh-plugin-thinking-mode.git"
+  },
+  "bugs": {
+    "url": "https://github.com/lovedheart/dsh-plugin-thinking-mode/issues"
+  },
+  "homepage": "https://github.com/lovedheart/dsh-plugin-thinking-mode#readme",
+  "author": "lovedheart",
   "exports": {
     ".": "./lib/index.js",
     "./package.json": "./package.json"
@@ -14,7 +24,16 @@
     "lib/messages.js",
     "lib/stream.js",
     "cordis.patch.yml",
-    "README.md"
+    "test/harness-test.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "deepseek-harness",
+    "dsh-plugin",
+    "thinking-mode",
+    "qwen",
+    "llm"
   ],
   "scripts": {
     "test": "node test/harness-test.mjs"

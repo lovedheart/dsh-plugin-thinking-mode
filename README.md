@@ -85,29 +85,31 @@ Qwen3.8 官方支持 `reasoning_effort` 调节推理深度与成本：
 
 ## 安装
 
-### 方式 A：profile 用户层（本机推荐，HMR 热加载）
+> 适用版本：DSH `0.1.0-rc.6`（peer 依赖即钉在此版本；升级 DSH 后请确认 peer 依赖仍满足）。
 
-在 `~/.dsh/profiles/<profile>/cordis.patch.yml` 追加一行（与本机 rag-mcp-plugin 同一模式，绝对路径免 pnpm 安装）：
+### 方式 A：npm 安装（推荐，已发布形态）
+
+```sh
+dsh plugin --profile web add dsh-plugin-thinking-mode
+```
+
+插件的 `package.json` 声明了 `dsh.bundle.patch`（`cordis.patch.yml`）与 peer 依赖（dsh-tools / dsh-system-prompt / dsh-llm / dsh-settings / cordis），`dsh plugin add` 会从 npm 拉取并注入 bundle 补丁。安装后 `thinking_mode` 工具、`thinking-mode` 设置节、系统提示段与 `llm/stream` 拦截器即自动注册。
+
+### 方式 B：本地源码（开发 / 未发布时，HMR 热加载）
+
+把本地源码目录的补丁行追加到 `~/.dsh/profiles/<profile>/cordis.patch.yml`（绝对路径免 pnpm 安装）：
 
 ```yaml
 - insert:
     - id: thinking-mode
-      name: '/home/lovedheart/Documents/dsh-plugin-thinking-mode/lib/index.js'
+      name: '/path/to/your/local/dsh-plugin-thinking-mode/lib/index.js'
       config:
         defaultMode: auto
         modelPatterns:
           - qwen
 ```
 
-运行中的 `dsh web` 进程会由 HMR/launcher watch 热加载用户补丁层；未生效时重启 `dsh web` 即可。
-
-### 方式 B：pnpm bundle（可分发形态）
-
-```sh
-dsh plugin --profile web add /path/to/dsh-plugin-thinking-mode
-```
-
-插件的 `package.json` 声明了 `dsh.bundle.patch`（`cordis.patch.yml`）与 peer 依赖（dsh-tools / dsh-system-prompt / dsh-llm / dsh-settings / cordis），与 `dsh-plugin-reme` 同构。
+把 `name` 换成你本地的实际路径。运行中的 `dsh web` 进程会由 HMR/launcher watch 热加载用户补丁层；未生效时重启 `dsh web` 即可。
 
 ## 配置
 
@@ -140,15 +142,16 @@ npm test          # = node test/harness-test.mjs
 ## 文件结构
 
 ```
-├── package.json          # 插件清单（dsh.bundle.patch、peer 依赖）
-├── cordis.patch.yml      # bundle 层补丁（方式 B 安装时使用）
+├── package.json          # 插件清单（dsh.bundle.patch、peer 依赖、发布字段）
+├── cordis.patch.yml      # bundle 层补丁（npm 安装时自动注入）
+├── LICENSE               # MIT
 ├── lib/
 │   ├── index.js          # 入口：工具 + 设置节 + 系统提示段 + 安装拦截器
 │   ├── intercept.js      # llm/stream waterfall 拦截 + 路由判定
 │   ├── messages.js       # Harness 消息 → OpenAI wire 转换（对齐 pi-ai 适配器）
 │   └── stream.js         # OpenAI SSE → StreamChunk + replayState 合成
 └── test/
-    └── harness-test.mjs  # 独立集成测试（node test/harness-test.mjs）
+    └── harness-test.mjs  # 独立集成测试（npm test）
 ```
 
 ## 限制
