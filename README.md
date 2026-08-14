@@ -39,6 +39,20 @@ DeepSeek Harness 插件：为 **Qwen3 系列模型**（Qwen3.8-27B 等，经 Ope
 
 预设是**设置节字段**（`sampling`，Web 设置页可编辑），默认即上表；`applySampling: false` 可关闭覆盖、恢复原始采样透传。`auto` 模式始终不碰采样参数（纯透传）。
 
+### reasoning_effort（推理深度档位）
+
+Qwen3.8 官方支持 `reasoning_effort` 调节推理深度与成本：
+
+| 档位 | 说明 |
+| --- | --- |
+| `xhigh`（默认） | 复杂任务、彻底分析，成本最高 |
+| `medium` | 精度与速度平衡 |
+| `low` | 高效推理，最省最快 |
+
+- 设置节字段 `reasoningEffort`（Web 设置页可改，也可在对话里让我改）
+- 发送策略：`on` 模式始终发送（顶层 `reasoning_effort` 字段）；`off` 模式仅在选了非默认档位时发送（思考关闭时 provider 侧本无效果）；`auto` 模式永不发送（纯透传）
+- 端点合法值（实测 SGLang）：`none/minimal/low/medium/high/xhigh/max`；非法值返回 HTTP 400，所以插件只发送三个官方档位
+
 ## 工作原理（安全性说明）
 
 1. 插件在 `llm/stream` waterfall 上注册 `global` 监听器（文档化的网关模式）。
@@ -81,6 +95,7 @@ dsh plugin --profile web add /path/to/dsh-plugin-thinking-mode
 | `modelPatterns` | `string[]` | `["qwen"]` | 对模型 id 做不区分大小写的子串匹配；只有命中的模型才会被拦截 |
 | `applySampling` | `boolean` | `true` | 拦截时是否按模式强制官方推荐采样参数 |
 | `sampling` | 对象 | 见上表 | 两套预设 `thinking` / `instruct`，各含 6 个采样字段（Web 设置页可改） |
+| `defaultReasoningEffort` | `"xhigh" \| "medium" \| "low"` | `"xhigh"` | 用户未显式选择前的推理深度档位 |
 
 运行时状态（`thinking-mode` 设置节的 `mode`）优先于 `defaultMode`。
 
@@ -119,5 +134,5 @@ npm test          # = node test/harness-test.mjs
 - 状态为实例级全局，不是每会话（v1 取舍）。
 - 仅拦截 `openai-completions` 路由的匹配模型；其他 provider/路由一律透传。
 - 采样预设按 Qwen3.8 模型卡片写死为默认值；`top_k`/`min_p`/`repetition_penalty` 在 SGLang 上已验证接受，其他 OpenAI 兼容端点若不接受未知键会自行忽略（SGLang 即忽略未知键，已实测）。
-- 拦截路径当前不支持 provider 侧的 `reasoning_effort` 细粒度档位（Qwen3.8 支持 xhigh/medium/low，可后续扩展）。
+- `reasoning_effort` 当前提供三个官方档位（xhigh/medium/low）；端点还支持 none/minimal/high/max，可后续按需扩展。
 - 图片请求要求附件服务存在（dsh 标准组合默认具备）；缺失时透传。
