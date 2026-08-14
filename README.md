@@ -1,0 +1,105 @@
+# dsh-plugin-thinking-mode
+
+DeepSeek Harness 插件：为 **Qwen3 系列模型**（Qwen3.8-27B 等，经 OpenAI 兼容端点提供，如 SGLang / vLLM / Qwen Cloud 兼容网关）**切换思考（thinking）模式**。
+
+参考：
+
+- 模型卡片 <https://huggingface.co/Qwen/Qwen3.8-27B> —— Qwen3.8 默认**开启**思考，可通过 Chat Completions API 的 `chat_template_kwargs: { enable_thinking: true|false }` 按请求开关。
+- DSH 插件教程 <https://deepseek-harness.github.io/deepseek-harness/develop/basic/>
+
+## 功能
+
+| 组件 | 说明 |
+| --- | --- |
+| `thinking_mode` 工具 | 模型或用户可调用：`get` / `on` / `off` / `auto` / `toggle`。输出当前模式、说明、是否变更，以及默认模型路由上拦截是否生效（`interceptActive`）。 |
+| `thinking-mode` 设置节 | 持久化在 `~/.dsh/settings.yaml`，`applies: live` 即时生效，并在 Web 设置页中显示（设置页里也能直接切换，是第二个切换入口）。 |
+| 系统提示段 | 每轮重新渲染，向模型报告当前模式及可用操作（模型知道如何响应"关闭思考/打开思考"这类指令）。 |
+| `llm/stream` 拦截器 | 全局 waterfall 监听器。当模式为 `on`/`off` **且** 请求命中匹配的 provider/model 时，插件用自建的 OpenAI 兼容客户端直接发流式请求，与标准 pi-ai 请求相比**唯一差异**是请求体多了 `chat_template_kwargs.enable_thinking`；其余报文（消息转换、工具、usage、SSE 解析）逐字段对齐标准适配器。`auto` 模式为纯透传，零改动。 |
+
+### 三种模式
+
+- **auto**（默认）：完全透传，使用 provider 自身默认（Qwen3.8 默认开思考）。零风险，不影响现有行为。
+- **on**：强制 `enable_thinking: true` —— 模型先推理再回答（产生 reasoning 内容）。
+- **off**：强制 `enable_thinking: false` —— 直接回答，更快更省（实测 27B 上约 4 倍响应事件数差异，token 更少）。
+
+模式是**实例级全局状态**（一个设置节，所有会话共享）——v1 的取舍，README 级别记录于此。
+
+## 工作原理（安全性说明）
+
+1. 插件在 `llm/stream` waterfall 上注册 `global` 监听器（文档化的网关模式）。
+2. 每次模型调用时按顺序判断：模式是否 `auto`？→ provider 设置节（`llm-pi-ai`，实时读取）里该 provider 的 `api` 是否为 `openai-completions`？→ 有无 `baseURL`？→ 模型 id 是否命中 `modelPatterns`（不区分大小写子串，默认 `["qwen"]`）？→ 用户消息含图片时附件服务是否可用？
+3. 任何一项不满足 → `yield* await next()` 走标准适配器路径（**所有不确定性都退化为透传**）。
+4. 命中时直接请求 `baseURL/chat/completions`，SSE 转成协议合法的 StreamChunk 序列，并合成 pi-ai `replayState`（`kind: 'pi-ai'`, `version: 1`, `api: 'openai-completions'`），使后续轮次的历史重建与标准路径完全一致（会话回放不受影响）。
+5. 所有输出都经过 dsh-llm 全局流不变量校验（块配对、usage 唯一、finish 终止等）。
+
+## 安装
+
+### 方式 A：profile 用户层（本机推荐，HMR 热加载）
+
+在 `~/.dsh/profiles/<profile>/cordis.patch.yml` 追加一行（与本机 rag-mcp-plugin 同一模式，绝对路径免 pnpm 安装）：
+
+```yaml
+- insert:
+    - id: thinking-mode
+      name: '/home/lovedheart/Documents/dsh-plugin-thinking-mode/lib/index.js'
+      config:
+        defaultMode: auto
+        modelPatterns:
+          - qwen
+```
+
+运行中的 `dsh web` 进程会由 HMR/launcher watch 热加载用户补丁层；未生效时重启 `dsh web` 即可。
+
+### 方式 B：pnpm bundle（可分发形态）
+
+```sh
+dsh plugin --profile web add /path/to/dsh-plugin-thinking-mode
+```
+
+插件的 `package.json` 声明了 `dsh.bundle.patch`（`cordis.patch.yml`）与 peer 依赖（dsh-tools / dsh-system-prompt / dsh-llm / dsh-settings / cordis），与 `dsh-plugin-reme` 同构。
+
+## 配置
+
+| 字段 | 类型 | 默认 | 说明 |
+| --- | --- | --- | --- |
+| `defaultMode` | `"auto" \| "on" \| "off"` | `"auto"` | 用户未显式选择前的模式 |
+| `modelPatterns` | `string[]` | `["qwen"]` | 对模型 id 做不区分大小写的子串匹配；只有命中的模型才会被拦截 |
+
+运行时状态（`thinking-mode` 设置节的 `mode`）优先于 `defaultMode`。
+
+## 开发 / 测试
+
+```sh
+# 独立集成测试（mock SSE 服务器 + 独立 cordis Context，不依赖 dsh 运行实例）：
+ln -s ~/.dsh/profiles/node_modules node_modules   # 开发用符号链接（已 gitignore）
+npm test          # = node test/harness-test.mjs
+```
+
+测试覆盖：Config 默认值、工具五种动作与状态迁移、系统提示动态文本、`off`/`on` 直连路由（请求体逐字段断言：`chat_template_kwargs`、工具函数形态、消息 wire 转换、鉴权头）、chunk 流语法校验（不变量规则复现）、`replayState` 精确断言、`auto`/非匹配模型透传、HTTP 500 与空响应终止、图片请求在附件服务缺省时的退化与存在时的直连。
+
+已验证（本机 SGLang + Qwen3.8-27B 实测）：
+
+- `enable_thinking: false` 时响应无 `reasoning_content`，更快；`true` 时有推理内容。
+- **off 模式 + 工具调用正常**（`finish_reason: tool_calls`，名称与参数正常流式返回）——agent 循环在拦截路径上完整可用。
+- 沙箱 DSH_HOME 中完整 dsh headless 启动 + 真实模型跑通：工具切换、拦截激活（`interceptActive: true`）、状态跨重启持久化。
+
+## 文件结构
+
+```
+├── package.json          # 插件清单（dsh.bundle.patch、peer 依赖）
+├── cordis.patch.yml      # bundle 层补丁（方式 B 安装时使用）
+├── lib/
+│   ├── index.js          # 入口：工具 + 设置节 + 系统提示段 + 安装拦截器
+│   ├── intercept.js      # llm/stream waterfall 拦截 + 路由判定
+│   ├── messages.js       # Harness 消息 → OpenAI wire 转换（对齐 pi-ai 适配器）
+│   └── stream.js         # OpenAI SSE → StreamChunk + replayState 合成
+└── test/
+    └── harness-test.mjs  # 独立集成测试（node test/harness-test.mjs）
+```
+
+## 限制
+
+- 状态为实例级全局，不是每会话（v1 取舍）。
+- 仅拦截 `openai-completions` 路由的匹配模型；其他 provider/路由一律透传。
+- 拦截路径当前不支持 provider 侧的 `reasoning_effort` 细粒度档位（Qwen3.8 支持 xhigh/medium/low，可后续扩展）。
+- 图片请求要求附件服务存在（dsh 标准组合默认具备）；缺失时透传。

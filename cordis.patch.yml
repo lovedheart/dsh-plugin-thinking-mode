@@ -1,0 +1,28 @@
+# dsh-plugin-thinking-mode: per-request thinking-mode switch for
+# Qwen3-family models (Qwen3.8-27B, ...) served on OpenAI-compatible
+# endpoints (SGLang / vLLM / Qwen Cloud-compatible gateways).
+#
+# The plugin registers:
+#   - a `thinking_mode` tool the model (or user, via chat) can call:
+#     get / on / off / auto / toggle
+#   - a `thinking-mode` settings section (persisted in settings.yaml,
+#     live-applied, rendered in the Web UI settings page)
+#   - a system-prompt section that reports the current mode every turn
+#   - an `llm/stream` waterfall intercept: when the mode is 'on' or 'off'
+#     and the request targets a matching model, the plugin routes the
+#     call through its own OpenAI-compatible client that adds
+#     chat_template_kwargs.enable_thinking to the request body. In 'auto'
+#     mode (default) every request passes through untouched and the
+#     provider's own default applies (thinking ON for Qwen3.8).
+#
+# Row configuration:
+#   defaultMode:   auto | on | off   (default 'auto')
+#   modelPatterns: case-insensitive substrings matched against the model
+#                  id; only matching models are intercepted (default ['qwen'])
+- insert:
+    - id: thinking-mode
+      name: dsh-plugin-thinking-mode
+      config:
+        defaultMode: auto
+        modelPatterns:
+          - qwen
