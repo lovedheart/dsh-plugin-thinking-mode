@@ -14,7 +14,7 @@ DeepSeek Harness 插件：为 **Qwen3 系列模型**（Qwen3.8-27B 等，经 Ope
 | `thinking_mode` 工具 | 模型或用户可调用：`get` / `on` / `off` / `auto` / `toggle`。输出当前模式、说明、是否变更、两套采样预设，以及默认模型路由上拦截是否生效（`interceptActive`）。 |
 | `thinking-mode` 设置节 | 持久化在 `~/.dsh/settings.yaml`，`applies: live` 即时生效，并在 Web 设置页中显示（设置页里也能直接切换，是第二个切换入口）。 |
 | 系统提示段 | 每轮重新渲染，向模型报告当前模式及可用操作（模型知道如何响应"关闭思考/打开思考"这类指令）。 |
-| `llm/stream` 拦截器 | 全局 waterfall 监听器。当模式为 `on`/`off` **且** 请求命中匹配的 provider/model 时，插件用自建的 OpenAI 兼容客户端直接发流式请求，与标准 pi-ai 请求相比**唯一差异**是请求体多了 `chat_template_kwargs.enable_thinking`；其余报文（消息转换、工具、usage、SSE 解析）逐字段对齐标准适配器。`auto` 模式为纯透传，零改动。 |
+| `llm/stream` 拦截器 | 全局 waterfall 监听器。当模式为 `on`/`off` **且** 请求命中匹配的 provider/model 时，插件用自建的 OpenAI 兼容客户端直接发流式请求，与标准 pi-ai 请求相比的差异是请求体多了 `chat_template_kwargs.enable_thinking`、按模式的采样预设（见上表）与 `reasoning_effort`（见上节）；其余报文（消息转换、工具、usage、SSE 解析）逐字段对齐标准适配器。`auto` 模式为纯透传，零改动。 |
 
 ### 三种模式
 
@@ -60,6 +60,28 @@ Qwen3.8 官方支持 `reasoning_effort` 调节推理深度与成本：
 3. 任何一项不满足 → `yield* await next()` 走标准适配器路径（**所有不确定性都退化为透传**）。
 4. 命中时直接请求 `baseURL/chat/completions`，SSE 转成协议合法的 StreamChunk 序列，并合成 pi-ai `replayState`（`kind: 'pi-ai'`, `version: 1`, `api: 'openai-completions'`），使后续轮次的历史重建与标准路径完全一致（会话回放不受影响）。
 5. 所有输出都经过 dsh-llm 全局流不变量校验（块配对、usage 唯一、finish 终止等）。
+
+## 切换为什么需要等待（延迟构成）
+
+切换动作**本身是瞬时的**（一次本地设置写入，毫秒级）。对话里"打开/关闭思考"感知到的等待来自**围绕它的完整模型推理**，共三层：
+
+1. **一次对话切换 = 两次完整模型调用**。第 1 次：模型处理指令、决定调用 `thinking_mode` 工具（需预编码整个会话上下文）；工具执行（瞬时）；第 2 次：模型读取工具结果、生成确认回复（再过一遍上下文）。首 token 延迟（TTFT）随上下文大小近似线性增长，大上下文会话每次调用要等数秒到十几秒。
+2. **新模式从下一次模型调用才生效**。当前正在生成的回复仍由旧模式完成，所以真正体验到新模式要再发一条消息、再等一次完整推理——感知上像"切了两次才见效"。
+3. **on 模式正文更晚出现**。模型先输出 `reasoning_content` 再输出正文，推理 token 也算生成时间（`low` 档额外约几百毫秒到 1 秒，不是大头）。
+
+实测 TTFT 参考（本机 SGLang + Qwen3.8-27B，2026-08-15）：
+
+| 请求规模 | 思考关（off） | 思考开（on + low） |
+| --- | --- | --- |
+| ~2k token | — | 684ms |
+| ~20k token | 7.9s | 7.2s |
+| ~50k token | 17.2s | — |
+
+**减少等待的办法：**
+
+- **用 Web 设置页直接改**（最快）：设置 → `thinking-mode` 节，改 `mode` / `reasoningEffort` 保存——**零模型调用**，下次模型请求即生效。
+- **新开会话**：上下文小，每次调用约 1 秒内出首 token。
+- 对话里切换的等待省不掉——它是"让模型执行指令"的固有成本；切换频繁时建议走设置页。
 
 ## 安装
 
