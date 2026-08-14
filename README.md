@@ -11,7 +11,7 @@ DeepSeek Harness 插件：为 **Qwen3 系列模型**（Qwen3.8-27B 等，经 Ope
 
 | 组件 | 说明 |
 | --- | --- |
-| `thinking_mode` 工具 | 模型或用户可调用：`get` / `on` / `off` / `auto` / `toggle`。输出当前模式、说明、是否变更，以及默认模型路由上拦截是否生效（`interceptActive`）。 |
+| `thinking_mode` 工具 | 模型或用户可调用：`get` / `on` / `off` / `auto` / `toggle`。输出当前模式、说明、是否变更、两套采样预设，以及默认模型路由上拦截是否生效（`interceptActive`）。 |
 | `thinking-mode` 设置节 | 持久化在 `~/.dsh/settings.yaml`，`applies: live` 即时生效，并在 Web 设置页中显示（设置页里也能直接切换，是第二个切换入口）。 |
 | 系统提示段 | 每轮重新渲染，向模型报告当前模式及可用操作（模型知道如何响应"关闭思考/打开思考"这类指令）。 |
 | `llm/stream` 拦截器 | 全局 waterfall 监听器。当模式为 `on`/`off` **且** 请求命中匹配的 provider/model 时，插件用自建的 OpenAI 兼容客户端直接发流式请求，与标准 pi-ai 请求相比**唯一差异**是请求体多了 `chat_template_kwargs.enable_thinking`；其余报文（消息转换、工具、usage、SSE 解析）逐字段对齐标准适配器。`auto` 模式为纯透传，零改动。 |
@@ -23,6 +23,21 @@ DeepSeek Harness 插件：为 **Qwen3 系列模型**（Qwen3.8-27B 等，经 Ope
 - **off**：强制 `enable_thinking: false` —— 直接回答，更快更省（实测 27B 上约 4 倍响应事件数差异，token 更少）。
 
 模式是**实例级全局状态**（一个设置节，所有会话共享）——v1 的取舍，README 级别记录于此。
+
+### 按模式强制官方推荐采样参数
+
+拦截路由同时会按模式覆盖请求体里的采样参数（Qwen3.8 模型卡片推荐值，SGLang wire 已验证接受）：
+
+| 参数 | on（thinking） | off（instruct） |
+| --- | --- | --- |
+| temperature | 1.0 | 0.7 |
+| top_p | 0.95 | 0.80 |
+| top_k | 20 | 20 |
+| min_p | 0.0 | 0.0 |
+| presence_penalty | 0.0 | 1.5 |
+| repetition_penalty | 1.0 | 1.0 |
+
+预设是**设置节字段**（`sampling`，Web 设置页可编辑），默认即上表；`applySampling: false` 可关闭覆盖、恢复原始采样透传。`auto` 模式始终不碰采样参数（纯透传）。
 
 ## 工作原理（安全性说明）
 
@@ -64,6 +79,8 @@ dsh plugin --profile web add /path/to/dsh-plugin-thinking-mode
 | --- | --- | --- | --- |
 | `defaultMode` | `"auto" \| "on" \| "off"` | `"auto"` | 用户未显式选择前的模式 |
 | `modelPatterns` | `string[]` | `["qwen"]` | 对模型 id 做不区分大小写的子串匹配；只有命中的模型才会被拦截 |
+| `applySampling` | `boolean` | `true` | 拦截时是否按模式强制官方推荐采样参数 |
+| `sampling` | 对象 | 见上表 | 两套预设 `thinking` / `instruct`，各含 6 个采样字段（Web 设置页可改） |
 
 运行时状态（`thinking-mode` 设置节的 `mode`）优先于 `defaultMode`。
 
@@ -101,5 +118,6 @@ npm test          # = node test/harness-test.mjs
 
 - 状态为实例级全局，不是每会话（v1 取舍）。
 - 仅拦截 `openai-completions` 路由的匹配模型；其他 provider/路由一律透传。
+- 采样预设按 Qwen3.8 模型卡片写死为默认值；`top_k`/`min_p`/`repetition_penalty` 在 SGLang 上已验证接受，其他 OpenAI 兼容端点若不接受未知键会自行忽略（SGLang 即忽略未知键，已实测）。
 - 拦截路径当前不支持 provider 侧的 `reasoning_effort` 细粒度档位（Qwen3.8 支持 xhigh/medium/low，可后续扩展）。
 - 图片请求要求附件服务存在（dsh 标准组合默认具备）；缺失时透传。
