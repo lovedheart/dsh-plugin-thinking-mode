@@ -139,12 +139,14 @@ assert.deepEqual(parsedConfig.sampling.instruct, {
   presence_penalty: 1.5,
   repetition_penalty: 1.0,
 });
+assert.equal(parsedConfig.defaultReasoningEffort, "xhigh");
 
 plugin.apply(ctx, {
   defaultMode: "auto",
   modelPatterns: ["qwen"],
   applySampling: true,
   sampling: parsedConfig.sampling,
+  defaultReasoningEffort: "xhigh",
 });
 
 assert.equal(registeredSettingsNs, settingsNamespace("thinking-mode"));
@@ -163,6 +165,12 @@ assert.equal(out.interceptActive, false);
 assert.equal(out.sampling.applySampling, true);
 assert.equal(out.sampling.thinking.temperature, 1.0);
 assert.equal(out.sampling.instruct.presence_penalty, 1.5);
+assert.equal(out.reasoningEffort, "xhigh");
+
+// reasoning_effort is a persisted settings field: update + re-read.
+Object.assign(state, { reasoningEffort: "low" });
+out = await tool.execute({ action: "get" });
+assert.equal(out.reasoningEffort, "low");
 
 out = await tool.execute({ action: "off" });
 assert.equal(out.mode, "off");
@@ -171,12 +179,14 @@ assert.equal(out.interceptActive, true, "intercept active for default route in o
 assert.equal(state.mode, "off");
 
 assert.match(sections[0].text(), /Current mode: off/);
+assert.match(sections[0].text(), /Current reasoning_effort: low/);
 
 out = await tool.execute({ action: "toggle" });
 assert.equal(out.mode, "on");
 assert.equal(state.mode, "on");
 assert.equal(out.interceptActive, true, "intercept active for default route in on mode");
 assert.match(sections[0].text(), /Current mode: on/);
+assert.match(sections[0].text(), /Current reasoning_effort: low/);
 
 out = await tool.execute({ action: "toggle" });
 assert.equal(out.mode, "off");
@@ -185,6 +195,7 @@ out = await tool.execute({ action: "auto" });
 assert.equal(out.mode, "auto");
 assert.equal(out.changed, true);
 assert.equal(out.interceptActive, false, "no intercept in auto mode");
+Object.assign(state, { reasoningEffort: "xhigh" });
 
 // ── fake request + waterfall base (the "stock adapter") ────────────────
 const fakeOptions = {
@@ -319,6 +330,8 @@ assert.equal(req.body.top_k, 20);
 assert.equal(req.body.min_p, 0.0);
 assert.equal(req.body.presence_penalty, 1.5);
 assert.equal(req.body.repetition_penalty, 1.0);
+// Default effort (xhigh) is the provider default → not sent in off mode.
+assert.equal("reasoning_effort" in req.body, false);
 assert.equal(req.body.max_tokens, 1000);
 assert.equal(req.body.tools.length, 1);
 assert.equal(req.body.tools[0].type, "function");
@@ -391,6 +404,8 @@ assert.equal(requests[0].body.top_k, 20);
 assert.equal(requests[0].body.min_p, 0.0);
 assert.equal(requests[0].body.presence_penalty, 0.0);
 assert.equal(requests[0].body.repetition_penalty, 1.0);
+// In on mode the (default) effort is sent explicitly.
+assert.equal(requests[0].body.reasoning_effort, "xhigh");
 assert.deepEqual(
   chunks.map((c) => c.type),
   ["block-start", "reasoning-delta", "block-start", "text-delta", "block-end", "block-end", "usage", "finish"],
@@ -483,6 +498,51 @@ assert.ok(imageMsg, "multimodal user message present");
 assert.deepEqual(imageMsg.content[0], { type: "text", text: "what is this?" });
 assert.equal(imageMsg.content[1].type, "image_url");
 assert.ok(imageMsg.content[1].image_url.url.startsWith("data:image/png;base64,"));
+
+// ── case 9: reasoning_effort behavior matrix ───────────────────────────
+serverState.sse = SSE_TEXT;
+
+// on + low → sent (explicit non-default)
+state.mode = "on";
+Object.assign(state, { reasoningEffort: "low" });
+requests.length = 0;
+baseCalls = 0;
+chunks = await runWaterfall(fakeOptions);
+chunks = [...validateStream(chunks)];
+assert.equal(baseCalls, 0);
+assert.equal(requests.length, 1);
+assert.equal(requests[0].body.enable_thinking === undefined, true);
+assert.deepEqual(requests[0].body.chat_template_kwargs, { enable_thinking: true });
+assert.equal(requests[0].body.reasoning_effort, "low");
+
+// off + low → sent (user explicitly chose a non-default level)
+state.mode = "off";
+requests.length = 0;
+baseCalls = 0;
+chunks = await runWaterfall(fakeOptions);
+chunks = [...validateStream(chunks)];
+assert.equal(baseCalls, 0);
+assert.equal(requests.length, 1);
+assert.equal(requests[0].body.reasoning_effort, "low");
+
+// off + xhigh (default) → omitted (provider default, and thinking is off)
+Object.assign(state, { reasoningEffort: "xhigh" });
+requests.length = 0;
+baseCalls = 0;
+chunks = await runWaterfall(fakeOptions);
+chunks = [...validateStream(chunks)];
+assert.equal(baseCalls, 0);
+assert.equal(requests.length, 1);
+assert.equal("reasoning_effort" in requests[0].body, false);
+
+// auto → passthrough: the stock adapter is used, effort never touches the wire
+state.mode = "auto";
+requests.length = 0;
+baseCalls = 0;
+chunks = await runWaterfall(fakeOptions);
+chunks = [...validateStream(chunks)];
+assert.equal(baseCalls, 1);
+assert.equal(requests.length, 0);
 
 // ── done ───────────────────────────────────────────────────────────────
 server.close();
