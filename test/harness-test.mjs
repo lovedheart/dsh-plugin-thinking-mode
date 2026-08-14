@@ -95,8 +95,9 @@ let registeredSettingsNs;
 ctx.provide("settings", {
   register: (ns, schema, options) => {
     registeredSettingsNs = ns;
+    const defaults = schema["~standard"].validate({}).value;
     return {
-      get: () => ({ ...state }),
+      get: () => ({ ...defaults, ...state }),
       update: async (patch) => {
         Object.assign(state, patch);
       },
@@ -119,9 +120,32 @@ assert.deepEqual(plugin.inject, ["tools", "systemPrompt", "settings"]);
 
 // Config schema defaults (Standard Schema v1 interface: `~standard.validate`).
 const parsedConfig = plugin.Config["~standard"].validate({}).value;
-assert.deepEqual(parsedConfig, { defaultMode: "auto", modelPatterns: ["qwen"] });
+assert.equal(parsedConfig.defaultMode, "auto");
+assert.deepEqual(parsedConfig.modelPatterns, ["qwen"]);
+assert.equal(parsedConfig.applySampling, true);
+assert.deepEqual(parsedConfig.sampling.thinking, {
+  temperature: 1.0,
+  top_p: 0.95,
+  top_k: 20,
+  min_p: 0.0,
+  presence_penalty: 0.0,
+  repetition_penalty: 1.0,
+});
+assert.deepEqual(parsedConfig.sampling.instruct, {
+  temperature: 0.7,
+  top_p: 0.8,
+  top_k: 20,
+  min_p: 0.0,
+  presence_penalty: 1.5,
+  repetition_penalty: 1.0,
+});
 
-plugin.apply(ctx, { defaultMode: "auto", modelPatterns: ["qwen"] });
+plugin.apply(ctx, {
+  defaultMode: "auto",
+  modelPatterns: ["qwen"],
+  applySampling: true,
+  sampling: parsedConfig.sampling,
+});
 
 assert.equal(registeredSettingsNs, settingsNamespace("thinking-mode"));
 assert.equal(tools.length, 1, "one tool registered");
@@ -133,12 +157,12 @@ assert.equal(sections[0].name, "tool:thinking_mode");
 const tool = tools[0];
 
 let out = await tool.execute({ action: "get" });
-assert.deepEqual(out, {
-  mode: "auto",
-  description: "provider default (thinking is ON by default for Qwen3.8)",
-  changed: false,
-  interceptActive: false,
-});
+assert.equal(out.mode, "auto");
+assert.equal(out.changed, false);
+assert.equal(out.interceptActive, false);
+assert.equal(out.sampling.applySampling, true);
+assert.equal(out.sampling.thinking.temperature, 1.0);
+assert.equal(out.sampling.instruct.presence_penalty, 1.5);
 
 out = await tool.execute({ action: "off" });
 assert.equal(out.mode, "off");
@@ -288,7 +312,13 @@ assert.equal(req.body.model, "Qwen3.8-27B");
 assert.equal(req.body.stream, true);
 assert.deepEqual(req.body.stream_options, { include_usage: true });
 assert.deepEqual(req.body.chat_template_kwargs, { enable_thinking: false });
+// Instruct sampling forced per the model card (overrides options.temperature 0.7).
 assert.equal(req.body.temperature, 0.7);
+assert.equal(req.body.top_p, 0.8);
+assert.equal(req.body.top_k, 20);
+assert.equal(req.body.min_p, 0.0);
+assert.equal(req.body.presence_penalty, 1.5);
+assert.equal(req.body.repetition_penalty, 1.0);
 assert.equal(req.body.max_tokens, 1000);
 assert.equal(req.body.tools.length, 1);
 assert.equal(req.body.tools[0].type, "function");
@@ -354,6 +384,13 @@ chunks = [...validateStream(chunks)];
 assert.equal(baseCalls, 0);
 assert.equal(requests.length, 1);
 assert.deepEqual(requests[0].body.chat_template_kwargs, { enable_thinking: true });
+// Thinking sampling forced per the model card.
+assert.equal(requests[0].body.temperature, 1.0);
+assert.equal(requests[0].body.top_p, 0.95);
+assert.equal(requests[0].body.top_k, 20);
+assert.equal(requests[0].body.min_p, 0.0);
+assert.equal(requests[0].body.presence_penalty, 0.0);
+assert.equal(requests[0].body.repetition_penalty, 1.0);
 assert.deepEqual(
   chunks.map((c) => c.type),
   ["block-start", "reasoning-delta", "block-start", "text-delta", "block-end", "block-end", "usage", "finish"],
