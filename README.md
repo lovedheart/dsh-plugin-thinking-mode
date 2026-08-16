@@ -11,7 +11,7 @@ DeepSeek Harness 插件：为 **Qwen3 系列模型**（Qwen3.8-27B 等，经 Ope
 
 | 组件 | 说明 |
 | --- | --- |
-| `thinking_mode` 工具 | 模型或用户可调用：`get` / `on` / `off` / `auto` / `toggle`。输出当前模式、说明、是否变更、两套采样预设，以及默认模型路由上拦截是否生效（`interceptActive`）。 |
+| `thinking_mode` 工具 | 模型或用户可调用：`get` / `on` / `off` / `auto` / `toggle`，并可**可选带 `reasoningEffort` 参数**（`xhigh` / `medium` / `low`）在同一调用里改推理深度。输出当前模式、说明、是否变更、两套采样预设、当前 `reasoningEffort`，以及默认模型路由上拦截是否生效（`interceptActive`）。 |
 | `thinking-mode` 设置节 | 持久化在 `~/.dsh/settings.yaml`，`applies: live` 即时生效，并在 Web 设置页中显示（设置页里也能直接切换，是第二个切换入口）。 |
 | 系统提示段 | 每轮重新渲染，向模型报告当前模式及可用操作（模型知道如何响应"关闭思考/打开思考"这类指令）。 |
 | `llm/stream` 拦截器 | 全局 waterfall 监听器。当模式为 `on`/`off` **且** 请求命中匹配的 provider/model 时，插件用自建的 OpenAI 兼容客户端直接发流式请求，与标准 pi-ai 请求相比的差异是请求体多了 `chat_template_kwargs.enable_thinking`、按模式的采样预设（见上表）与 `reasoning_effort`（见上节）；其余报文（消息转换、工具、usage、SSE 解析）逐字段对齐标准适配器。`auto` 模式为纯透传，零改动。 |
@@ -49,7 +49,7 @@ Qwen3.8 官方支持 `reasoning_effort` 调节推理深度与成本：
 | `medium` | 精度与速度平衡 |
 | `low` | 高效推理，最省最快 |
 
-- 设置节字段 `reasoningEffort`（Web 设置页可改，也可在对话里让我改）
+- 设置节字段 `reasoningEffort`（三种改法：Web 设置页直接改；`thinking_mode` 工具带 `reasoningEffort` 参数在同一调用里改；或在对话里让我改）
 - 发送策略：`on` 模式始终发送（顶层 `reasoning_effort` 字段）；`off` 模式仅在选了非默认档位时发送（思考关闭时 provider 侧本无效果）；`auto` 模式永不发送（纯透传）
 - 端点合法值（实测 SGLang）：`none/minimal/low/medium/high/xhigh/max`；非法值返回 HTTP 400，所以插件只发送三个官方档位
 

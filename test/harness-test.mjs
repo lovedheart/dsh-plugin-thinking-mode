@@ -172,6 +172,26 @@ Object.assign(state, { reasoningEffort: "low" });
 out = await tool.execute({ action: "get" });
 assert.equal(out.reasoningEffort, "low");
 
+// reasoning_effort can now be changed via the tool's `reasoningEffort` param.
+out = await tool.execute({ action: "get", reasoningEffort: "medium" });
+assert.equal(out.reasoningEffort, "medium", "effort changed via tool param");
+assert.equal(out.changed, true, "changed reflects the effort change");
+assert.equal(state.reasoningEffort, "medium", "effort persisted to settings");
+out = await tool.execute({ action: "get", reasoningEffort: "medium" });
+assert.equal(out.reasoningEffort, "medium");
+assert.equal(out.changed, false, "no-op when effort already matches");
+// A single call can change mode AND effort together (merge update).
+out = await tool.execute({ action: "on", reasoningEffort: "xhigh" });
+assert.equal(out.mode, "on");
+assert.equal(out.reasoningEffort, "xhigh");
+assert.equal(out.changed, true);
+assert.equal(state.mode, "on");
+assert.equal(state.reasoningEffort, "xhigh");
+
+// Restore the low effort the remainder of the suite asserts on.
+out = await tool.execute({ action: "get", reasoningEffort: "low" });
+assert.equal(out.reasoningEffort, "low");
+
 out = await tool.execute({ action: "off" });
 assert.equal(out.mode, "off");
 assert.equal(out.changed, true);
