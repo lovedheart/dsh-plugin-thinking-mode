@@ -180,6 +180,26 @@ assert.equal(state.reasoningEffort, "medium", "effort persisted to settings");
 out = await tool.execute({ action: "get", reasoningEffort: "medium" });
 assert.equal(out.reasoningEffort, "medium");
 assert.equal(out.changed, false, "no-op when effort already matches");
+
+// preserveThinking defaults to false (schema default) and is reported by the tool.
+out = await tool.execute({ action: "get" });
+assert.equal(out.preserveThinking, false, "preserveThinking defaults to false");
+
+// preserveThinking can be changed via the tool's `preserveThinking` param and persists.
+out = await tool.execute({ action: "get", preserveThinking: true });
+assert.equal(out.preserveThinking, true, "preserveThinking changed via tool param");
+assert.equal(out.changed, true, "changed reflects the preserveThinking change");
+assert.equal(state.preserveThinking, true, "preserveThinking persisted to settings");
+out = await tool.execute({ action: "get", preserveThinking: true });
+assert.equal(out.preserveThinking, true);
+assert.equal(out.changed, false, "no-op when preserveThinking already matches");
+// A single call can change mode AND preserveThinking together (merge update).
+out = await tool.execute({ action: "on", preserveThinking: false });
+assert.equal(out.mode, "on");
+assert.equal(out.preserveThinking, false);
+assert.equal(out.changed, true);
+assert.equal(state.preserveThinking, false);
+
 // A single call can change mode AND effort together (merge update).
 out = await tool.execute({ action: "on", reasoningEffort: "xhigh" });
 assert.equal(out.mode, "on");
@@ -342,7 +362,7 @@ assert.equal(req.headers["content-type"], "application/json");
 assert.equal(req.body.model, "Qwen3.8-27B");
 assert.equal(req.body.stream, true);
 assert.deepEqual(req.body.stream_options, { include_usage: true });
-assert.deepEqual(req.body.chat_template_kwargs, { enable_thinking: false });
+assert.deepEqual(req.body.chat_template_kwargs, { enable_thinking: false, preserve_thinking: false });
 // Instruct sampling forced per the model card (overrides options.temperature 0.7).
 assert.equal(req.body.temperature, 0.7);
 assert.equal(req.body.top_p, 0.8);
@@ -416,7 +436,7 @@ chunks = await runWaterfall(fakeOptions);
 chunks = [...validateStream(chunks)];
 assert.equal(baseCalls, 0);
 assert.equal(requests.length, 1);
-assert.deepEqual(requests[0].body.chat_template_kwargs, { enable_thinking: true });
+assert.deepEqual(requests[0].body.chat_template_kwargs, { enable_thinking: true, preserve_thinking: false });
 // Thinking sampling forced per the model card.
 assert.equal(requests[0].body.temperature, 1.0);
 assert.equal(requests[0].body.top_p, 0.95);
@@ -434,6 +454,20 @@ assert.deepEqual(chunks[7].reason, { kind: "stop" });
 assert.equal(chunks[7].replayState.stopReason, "stop");
 assert.deepEqual(chunks[7].replayState.blocks, [{ type: "reasoning" }, { type: "text" }]);
 assert.deepEqual(chunks[6].usage, { inputTokens: 10, outputTokens: 4 });
+
+// ── case 2b: mode 'on' + preserveThinking true → preserve_thinking true ──
+state.mode = "on";
+state.preserveThinking = true;
+serverState.sse = SSE_TEXT;
+requests.length = 0;
+baseCalls = 0;
+chunks = await runWaterfall(fakeOptions);
+chunks = [...validateStream(chunks)];
+assert.equal(baseCalls, 0);
+assert.equal(requests.length, 1);
+assert.deepEqual(requests[0].body.chat_template_kwargs, { enable_thinking: true, preserve_thinking: true });
+// restore default for subsequent cases
+state.preserveThinking = false;
 
 // ── case 3: mode 'auto' → passthrough, no HTTP ─────────────────────────
 state.mode = "auto";
@@ -532,7 +566,7 @@ chunks = [...validateStream(chunks)];
 assert.equal(baseCalls, 0);
 assert.equal(requests.length, 1);
 assert.equal(requests[0].body.enable_thinking === undefined, true);
-assert.deepEqual(requests[0].body.chat_template_kwargs, { enable_thinking: true });
+assert.deepEqual(requests[0].body.chat_template_kwargs, { enable_thinking: true, preserve_thinking: false });
 assert.equal(requests[0].body.reasoning_effort, "low");
 
 // off + low → sent (user explicitly chose a non-default level)

@@ -11,7 +11,7 @@ DeepSeek Harness 插件：为 **Qwen3 系列模型**（Qwen3.8-27B 等，经 Ope
 
 | 组件 | 说明 |
 | --- | --- |
-| `thinking_mode` 工具 | 模型或用户可调用：`get` / `on` / `off` / `auto` / `toggle`，并可**可选带 `reasoningEffort` 参数**（`xhigh` / `medium` / `low`）在同一调用里改推理深度。输出当前模式、说明、是否变更、两套采样预设、当前 `reasoningEffort`，以及默认模型路由上拦截是否生效（`interceptActive`）。 |
+| `thinking_mode` 工具 | 模型或用户可调用：`get` / `on` / `off` / `auto` / `toggle`，并可**可选带 `reasoningEffort` 参数**（`xhigh` / `medium` / `low`）在同一调用里改推理深度、**可选带 `preserveThinking` 参数**（布尔）在同一调用里改是否保留历史思考内容（见下节）。输出当前模式、说明、是否变更、两套采样预设、当前 `reasoningEffort`、当前 `preserveThinking`，以及默认模型路由上拦截是否生效（`interceptActive`）。 |
 | `thinking-mode` 设置节 | 持久化在 `~/.dsh/settings.yaml`，`applies: live` 即时生效，并在 Web 设置页中显示（设置页里也能直接切换，是第二个切换入口）。 |
 | 系统提示段 | 每轮重新渲染，向模型报告当前模式及可用操作（模型知道如何响应"关闭思考/打开思考"这类指令）。 |
 | `llm/stream` 拦截器 | 全局 waterfall 监听器。当模式为 `on`/`off` **且** 请求命中匹配的 provider/model 时，插件用自建的 OpenAI 兼容客户端直接发流式请求，与标准 pi-ai 请求相比的差异是请求体多了 `chat_template_kwargs.enable_thinking`、按模式的采样预设（见上表）与 `reasoning_effort`（见上节）；其余报文（消息转换、工具、usage、SSE 解析）逐字段对齐标准适配器。`auto` 模式为纯透传，零改动。 |
@@ -52,6 +52,14 @@ Qwen3.8 官方支持 `reasoning_effort` 调节推理深度与成本：
 - 设置节字段 `reasoningEffort`（三种改法：Web 设置页直接改；`thinking_mode` 工具带 `reasoningEffort` 参数在同一调用里改；或在对话里让我改）
 - 发送策略：`on` 模式始终发送（顶层 `reasoning_effort` 字段）；`off` 模式仅在选了非默认档位时发送（思考关闭时 provider 侧本无效果）；`auto` 模式永不发送（纯透传）
 - 端点合法值（实测 SGLang）：`none/minimal/low/medium/high/xhigh/max`；非法值返回 HTTP 400，所以插件只发送三个官方档位
+
+### preserve_thinking（是否保留历史思考内容）
+
+Qwen3 的 `preserve_thinking`（同样经 `chat_template_kwargs` 按请求传递）控制**历史轮次的 `reasoning_content` 是否保留在上下文中**：
+
+- **约定（核心交互规则）**：当用户要**开启** thinking 时，插件引导 agent **先用 `ask_user_question` 询问用户**是否保留思考内容，再把答案通过 `thinking_mode` 工具的 `preserveThinking` 参数写入；当**关闭** thinking 时，请求**恒发送 `preserve_thinking: false`**，无需询问。
+- 发送策略：思考**开**时按设置节里的用户选择发送（`true`/`false`）；思考**关**时一律 `false`（显式发送，保证确定性与 off 模式语义一致）；`auto` 模式纯透传，插件不碰该字段。
+- 设置节字段 `preserveThinking`（默认 `false`），与 `reasoningEffort` 同生命周期：Web 设置页可改、工具参数可改、对话里让 agent 改。
 
 ## 工作原理（安全性说明）
 
@@ -120,6 +128,7 @@ dsh plugin --profile web add dsh-plugin-thinking-mode
 | `applySampling` | `boolean` | `true` | 拦截时是否按模式强制官方推荐采样参数 |
 | `sampling` | 对象 | 见上表 | 两套预设 `thinking` / `instruct`，各含 6 个采样字段（Web 设置页可改） |
 | `defaultReasoningEffort` | `"xhigh" \| "medium" \| "low"` | `"xhigh"` | 用户未显式选择前的推理深度档位 |
+| `preserveThinking`（设置节） | `boolean` | `false` | 思考开启时是否保留历史 `reasoning_content`（思考关闭时恒为 `false`） |
 
 运行时状态（`thinking-mode` 设置节的 `mode`）优先于 `defaultMode`。
 
