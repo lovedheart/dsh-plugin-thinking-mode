@@ -1,11 +1,12 @@
 /**
  * Standalone integration test for dsh-plugin-thinking-mode.
  *
- * Boots a minimal cordis Context with stub tools/systemPrompt/settings
- * services, applies the plugin, and exercises:
- *   - the Config schema defaults
- *   - the thinking_mode tool transitions (get/on/off/auto/toggle)
- *   - the dynamic system-prompt section
+ * Boots a minimal cordis Context with stub tools/systemPrompt/settings/
+ * configEditor services, applies the plugin, and exercises:
+ *   - the Config schema defaults (live fields as volatile references)
+ *   - the thinking_mode tool transitions (get/on/off/auto/toggle), whose
+ *     changes are written back through the settings service
+ *   - the dynamic system-prompt context
  *   - the llm/stream waterfall: direct route (on/off) against a mock
  *     OpenAI-compatible SSE server, passthrough (auto, unmatched model,
  *     image without attachment service), HTTP error and empty-response
@@ -17,7 +18,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import * as plugin from "../lib/index.js";
 import { Context } from "@deepseek-ai/cordis";
-import { settingsNamespace } from "@deepseek-ai/dsh-settings";
+import { updateVolatile, volatileEntries } from "@deepseek-ai/cosmokit";
 
 // ── canned SSE payloads ────────────────────────────────────────────────
 const SSE_TOOL = [
@@ -71,6 +72,29 @@ const server = http.createServer((req, res) => {
 await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
 const baseURL = `http://127.0.0.1:${server.address().port}/v1`;
 
+// ── the profile entry under test ───────────────────────────────────────
+// The plugin's state IS its entry configuration: raw values (what a profile
+// patch would store) plus the live volatile references the Loader hands the
+// running instance. A settings write re-validates the raw values and commits
+// them into those same references — cordis-plugin-loader's volatile-only path,
+// reproduced here so the plugin under test is exercised exactly as the host
+// would exercise it.
+const ENTRY_ID = "thinking-mode";
+const entryRaw = { defaultMode: "auto", modelPatterns: ["qwen"] };
+const entryConfig = plugin.Config["~standard"].validate(entryRaw).value;
+
+let revision = 0;
+let failWrites = false;
+const writes = [];
+const violations = [];
+
+function commitVolatile() {
+  const candidate = plugin.Config["~standard"].validate(entryRaw).value;
+  for (const { path, ref } of volatileEntries(entryConfig)) {
+    updateVolatile(ref, path.reduce((value, key) => Reflect.get(value, key), candidate));
+  }
+}
+
 // ── stub services on a root cordis context ─────────────────────────────
 const ctx = new Context();
 
@@ -78,10 +102,14 @@ const tools = [];
 ctx.provide("tools", { register: (tool) => tools.push(tool) });
 
 const sections = [];
-ctx.provide("systemPrompt", { section: (section) => sections.push(section) });
+const contexts = [];
+ctx.provide("systemPrompt", {
+  section: (section) => sections.push(section),
+  context: (context) => contexts.push(context),
+});
 
-const state = { mode: "auto" };
-const piSection = {
+// The provider routes live in the llm-pi-ai entry's Config.
+const piConfig = {
   providers: {
     sglang: {
       displayName: "SGLang",
@@ -91,39 +119,48 @@ const piSection = {
     },
   },
 };
-let registeredSettingsNs;
+ctx.provide("configEditor", {
+  entries: () => [{ options: { id: "llm-pi-ai" }, fiber: { config: piConfig } }],
+});
+
+// The default model route, as the plugin reads it through the service.
+ctx.provide("agentDefaultModel", {
+  currentSelection: () => ({ provider: "sglang", model: "Qwen3.8-27B" }),
+});
+
 ctx.provide("settings", {
-  register: (ns, schema, options) => {
-    registeredSettingsNs = ns;
-    const defaults = schema["~standard"].validate({}).value;
-    return {
-      get: () => ({ ...defaults, ...state }),
-      update: async (patch) => {
-        Object.assign(state, patch);
-      },
-      watch: () => () => {},
-    };
-  },
-  get: (ns) => {
-    if (ns === settingsNamespace("llm-pi-ai")) return piSection;
-    if (ns === settingsNamespace("agent-default-model"))
-      return { provider: "sglang", model: "Qwen3.8-27B" };
-    return undefined;
+  describe: () => [{ ns: ENTRY_ID, revision, applies: "live" }],
+  update: async (ns, patch, expectedRevision) => {
+    if (failWrites) throw new Error("profile patch is not writable");
+    writes.push({ ns, patch, expectedRevision, revision });
+    for (const key of Object.keys(patch)) {
+      if (plugin.Config.dict[key]?.meta?.volatile !== true) violations.push(`non-volatile field written: ${key}`);
+    }
+    Object.assign(entryRaw, patch);
+    commitVolatile();
+    revision += 1;
   },
 });
 
 process.env.TEST_THINKING_KEY = "secret-key-123";
 
+/** Write through the settings service the way the host's UI does. */
+async function setConfig(patch) {
+  await ctx.settings.update(ENTRY_ID, patch, revision);
+}
+
 // ── apply the plugin ───────────────────────────────────────────────────
 assert.equal(plugin.name, "thinking-mode");
 assert.deepEqual(plugin.inject, ["tools", "systemPrompt", "settings"]);
 
-// Config schema defaults (Standard Schema v1 interface: `~standard.validate`).
-const parsedConfig = plugin.Config["~standard"].validate({}).value;
-assert.equal(parsedConfig.defaultMode, "auto");
-assert.deepEqual(parsedConfig.modelPatterns, ["qwen"]);
-assert.equal(parsedConfig.applySampling, true);
-assert.deepEqual(parsedConfig.sampling.thinking, {
+// Config schema (Standard Schema v1 interface: `~standard.validate`). The
+// state fields are volatile references; the rest are ordinary configuration.
+const parsed = plugin.Config["~standard"].validate({}).value;
+assert.equal(parsed.defaultMode, "auto");
+assert.equal(parsed.mode.get(), undefined, "no stored mode until the user chooses one");
+assert.deepEqual(parsed.modelPatterns, ["qwen"]);
+assert.equal(parsed.applySampling.get(), true);
+assert.deepEqual(parsed.sampling.get().thinking, {
   temperature: 1.0,
   top_p: 0.95,
   top_k: 20,
@@ -131,7 +168,7 @@ assert.deepEqual(parsedConfig.sampling.thinking, {
   presence_penalty: 0.0,
   repetition_penalty: 1.0,
 });
-assert.deepEqual(parsedConfig.sampling.instruct, {
+assert.deepEqual(parsed.sampling.get().instruct, {
   temperature: 0.7,
   top_p: 0.8,
   top_k: 20,
@@ -139,21 +176,17 @@ assert.deepEqual(parsedConfig.sampling.instruct, {
   presence_penalty: 1.5,
   repetition_penalty: 1.0,
 });
-assert.equal(parsedConfig.defaultReasoningEffort, "xhigh");
+assert.equal(parsed.defaultReasoningEffort, "xhigh");
+assert.equal(parsed.reasoningEffort.get(), undefined, "no stored effort until the user chooses one");
+assert.equal(parsed.preserveThinking.get(), false);
 
-plugin.apply(ctx, {
-  defaultMode: "auto",
-  modelPatterns: ["qwen"],
-  applySampling: true,
-  sampling: parsedConfig.sampling,
-  defaultReasoningEffort: "xhigh",
-});
+plugin.apply(ctx, entryConfig);
 
-assert.equal(registeredSettingsNs, settingsNamespace("thinking-mode"));
 assert.equal(tools.length, 1, "one tool registered");
 assert.equal(tools[0].name, "thinking_mode");
-assert.equal(sections.length, 1, "one system-prompt section registered");
-assert.equal(sections[0].name, "tool:thinking_mode");
+assert.equal(sections.length, 0, "the live state is not a system-prompt section");
+assert.equal(contexts.length, 1, "one dynamic context registered");
+assert.equal(contexts[0].name, "thinking-mode:state");
 
 // ── tool transitions ───────────────────────────────────────────────────
 const tool = tools[0];
@@ -166,17 +199,20 @@ assert.equal(out.sampling.applySampling, true);
 assert.equal(out.sampling.thinking.temperature, 1.0);
 assert.equal(out.sampling.instruct.presence_penalty, 1.5);
 assert.equal(out.reasoningEffort, "xhigh");
+assert.deepEqual(writes, [], "a read-only call writes nothing");
 
-// reasoning_effort is a persisted settings field: update + re-read.
-Object.assign(state, { reasoningEffort: "low" });
+// reasoning_effort is a persisted config field: the write goes through the
+// settings service and is visible to every later reader.
+await setConfig({ reasoningEffort: "low" });
 out = await tool.execute({ action: "get" });
 assert.equal(out.reasoningEffort, "low");
 
-// reasoning_effort can now be changed via the tool's `reasoningEffort` param.
+// reasoning_effort can be changed via the tool's `reasoningEffort` param.
 out = await tool.execute({ action: "get", reasoningEffort: "medium" });
 assert.equal(out.reasoningEffort, "medium", "effort changed via tool param");
 assert.equal(out.changed, true, "changed reflects the effort change");
-assert.equal(state.reasoningEffort, "medium", "effort persisted to settings");
+assert.deepEqual(writes.at(-1).patch, { reasoningEffort: "medium" }, "one merged write");
+assert.equal(entryRaw.reasoningEffort, "medium", "effort persisted to the entry config");
 out = await tool.execute({ action: "get", reasoningEffort: "medium" });
 assert.equal(out.reasoningEffort, "medium");
 assert.equal(out.changed, false, "no-op when effort already matches");
@@ -189,24 +225,27 @@ assert.equal(out.preserveThinking, false, "preserveThinking defaults to false");
 out = await tool.execute({ action: "get", preserveThinking: true });
 assert.equal(out.preserveThinking, true, "preserveThinking changed via tool param");
 assert.equal(out.changed, true, "changed reflects the preserveThinking change");
-assert.equal(state.preserveThinking, true, "preserveThinking persisted to settings");
+assert.equal(entryRaw.preserveThinking, true, "preserveThinking persisted to the entry config");
 out = await tool.execute({ action: "get", preserveThinking: true });
 assert.equal(out.preserveThinking, true);
 assert.equal(out.changed, false, "no-op when preserveThinking already matches");
-// A single call can change mode AND preserveThinking together (merge update).
+// A single call can change mode AND preserveThinking together (one merged write).
 out = await tool.execute({ action: "on", preserveThinking: false });
 assert.equal(out.mode, "on");
 assert.equal(out.preserveThinking, false);
 assert.equal(out.changed, true);
-assert.equal(state.preserveThinking, false);
+assert.deepEqual(writes.at(-1).patch, { mode: "on", preserveThinking: false }, "one merged write");
+assert.equal(entryRaw.preserveThinking, false);
 
-// A single call can change mode AND effort together (merge update).
+// A single call can change mode AND effort together (one merged write).
+await setConfig({ mode: "off" });
 out = await tool.execute({ action: "on", reasoningEffort: "xhigh" });
 assert.equal(out.mode, "on");
 assert.equal(out.reasoningEffort, "xhigh");
 assert.equal(out.changed, true);
-assert.equal(state.mode, "on");
-assert.equal(state.reasoningEffort, "xhigh");
+assert.deepEqual(writes.at(-1).patch, { mode: "on", reasoningEffort: "xhigh" }, "one merged write");
+assert.equal(entryRaw.mode, "on");
+assert.equal(entryRaw.reasoningEffort, "xhigh");
 
 // Restore the low effort the remainder of the suite asserts on.
 out = await tool.execute({ action: "get", reasoningEffort: "low" });
@@ -216,17 +255,17 @@ out = await tool.execute({ action: "off" });
 assert.equal(out.mode, "off");
 assert.equal(out.changed, true);
 assert.equal(out.interceptActive, true, "intercept active for default route in off mode");
-assert.equal(state.mode, "off");
+assert.equal(entryRaw.mode, "off");
 
-assert.match(sections[0].text(), /Current mode: off/);
-assert.match(sections[0].text(), /Current reasoning_effort: low/);
+assert.match(contexts[0].text(), /Current mode: off/);
+assert.match(contexts[0].text(), /Current reasoning_effort: low/);
 
 out = await tool.execute({ action: "toggle" });
 assert.equal(out.mode, "on");
-assert.equal(state.mode, "on");
+assert.equal(entryRaw.mode, "on");
 assert.equal(out.interceptActive, true, "intercept active for default route in on mode");
-assert.match(sections[0].text(), /Current mode: on/);
-assert.match(sections[0].text(), /Current reasoning_effort: low/);
+assert.match(contexts[0].text(), /Current mode: on/);
+assert.match(contexts[0].text(), /Current reasoning_effort: low/);
 
 out = await tool.execute({ action: "toggle" });
 assert.equal(out.mode, "off");
@@ -235,7 +274,36 @@ out = await tool.execute({ action: "auto" });
 assert.equal(out.mode, "auto");
 assert.equal(out.changed, true);
 assert.equal(out.interceptActive, false, "no intercept in auto mode");
-Object.assign(state, { reasoningEffort: "xhigh" });
+await setConfig({ reasoningEffort: "xhigh" });
+
+// Every write so far addressed this entry at the revision it had just read.
+assert.deepEqual(
+  writes.map((row) => [row.ns, row.expectedRevision === row.revision]),
+  writes.map(() => [ENTRY_ID, true]),
+  "writes are addressed by entry id at the revision just described",
+);
+
+// A write the profile rejects is still in effect for this session (the switch
+// must not silently do nothing) and is reported as not persisted.
+failWrites = true;
+out = await tool.execute({ action: "on", reasoningEffort: "low" });
+assert.equal(out.mode, "on", "a rejected write is held for the session");
+assert.equal(out.reasoningEffort, "low", "…including the fields of the same call");
+assert.equal(out.persisted, false, "…and reported as session-only");
+assert.notEqual(entryRaw.mode, "on", "…without the profile being touched");
+out = await tool.execute({ action: "get" });
+assert.equal(out.mode, "on", "the held value keeps being reported");
+assert.equal(out.persisted, false);
+// Once the profile accepts writes again, the held values are re-offered and the
+// session converges onto the profile.
+failWrites = false;
+out = await tool.execute({ action: "off" });
+assert.equal(out.mode, "off", "the new write applies");
+assert.equal(out.reasoningEffort, "low", "the held effort survived until it could land");
+assert.equal(out.persisted, true, "…and landed, so the state is backed by the profile again");
+assert.equal(entryRaw.mode, "off");
+assert.equal(entryRaw.reasoningEffort, "low");
+await setConfig({ reasoningEffort: "xhigh" });
 
 // ── fake request + waterfall base (the "stock adapter") ────────────────
 const fakeOptions = {
@@ -347,7 +415,7 @@ function* validateStream(source) {
 }
 
 // ── case 1: mode 'off', Qwen model → direct route with tool calls ──────
-state.mode = "off";
+await setConfig({ mode: "off" });
 requests.length = 0;
 baseCalls = 0;
 let chunks = await runWaterfall(fakeOptions);
@@ -428,7 +496,7 @@ assert.deepEqual(chunks[13].replayState, {
 });
 
 // ── case 2: mode 'on' → enable_thinking true, text response ───────────
-state.mode = "on";
+await setConfig({ mode: "on" });
 serverState.sse = SSE_TEXT;
 requests.length = 0;
 baseCalls = 0;
@@ -456,8 +524,7 @@ assert.deepEqual(chunks[7].replayState.blocks, [{ type: "reasoning" }, { type: "
 assert.deepEqual(chunks[6].usage, { inputTokens: 10, outputTokens: 4 });
 
 // ── case 2b: mode 'on' + preserveThinking true → preserve_thinking true ──
-state.mode = "on";
-state.preserveThinking = true;
+await setConfig({ mode: "on", preserveThinking: true });
 serverState.sse = SSE_TEXT;
 requests.length = 0;
 baseCalls = 0;
@@ -467,10 +534,10 @@ assert.equal(baseCalls, 0);
 assert.equal(requests.length, 1);
 assert.deepEqual(requests[0].body.chat_template_kwargs, { enable_thinking: true, preserve_thinking: true });
 // restore default for subsequent cases
-state.preserveThinking = false;
+await setConfig({ preserveThinking: false });
 
 // ── case 3: mode 'auto' → passthrough, no HTTP ─────────────────────────
-state.mode = "auto";
+await setConfig({ mode: "auto" });
 requests.length = 0;
 baseCalls = 0;
 chunks = await runWaterfall(fakeOptions);
@@ -481,7 +548,7 @@ assert.equal(chunks.at(-1).reason.kind, "stop");
 assert.equal(chunks.find((c) => c.type === "text-delta").text, "base");
 
 // ── case 4: mode 'off', unmatched model → passthrough ─────────────────
-state.mode = "off";
+await setConfig({ mode: "off" });
 requests.length = 0;
 baseCalls = 0;
 chunks = await runWaterfall({ ...fakeOptions, model: "deepseek-v4-flash" });
@@ -491,7 +558,7 @@ assert.equal(requests.length, 0);
 
 // ── case 5: HTTP 500 → terminal error finish, code SERVER ─────────────
 serverState.status = 500;
-state.mode = "off";
+await setConfig({ mode: "off" });
 baseCalls = 0;
 chunks = await runWaterfall(fakeOptions);
 chunks = [...validateStream(chunks)];
@@ -511,7 +578,7 @@ assert.equal(chunks.at(-1).reason.failure.code, "EMPTY_RESPONSE");
 
 // ── case 7: image content without attachment service → passthrough ────
 serverState.sse = SSE_TEXT;
-state.mode = "off";
+await setConfig({ mode: "off" });
 requests.length = 0;
 baseCalls = 0;
 const imageOptions = {
@@ -540,7 +607,7 @@ ctx.provide("attachments", {
     ref: { id: "att_1", mediaType: "image/png" },
   }),
 });
-state.mode = "off";
+await setConfig({ mode: "off" });
 requests.length = 0;
 baseCalls = 0;
 chunks = await runWaterfall(imageOptions);
@@ -557,8 +624,7 @@ assert.ok(imageMsg.content[1].image_url.url.startsWith("data:image/png;base64,")
 serverState.sse = SSE_TEXT;
 
 // on + low → sent (explicit non-default)
-state.mode = "on";
-Object.assign(state, { reasoningEffort: "low" });
+await setConfig({ mode: "on", reasoningEffort: "low" });
 requests.length = 0;
 baseCalls = 0;
 chunks = await runWaterfall(fakeOptions);
@@ -570,7 +636,7 @@ assert.deepEqual(requests[0].body.chat_template_kwargs, { enable_thinking: true,
 assert.equal(requests[0].body.reasoning_effort, "low");
 
 // off + low → sent (user explicitly chose a non-default level)
-state.mode = "off";
+await setConfig({ mode: "off" });
 requests.length = 0;
 baseCalls = 0;
 chunks = await runWaterfall(fakeOptions);
@@ -580,7 +646,7 @@ assert.equal(requests.length, 1);
 assert.equal(requests[0].body.reasoning_effort, "low");
 
 // off + xhigh (default) → omitted (provider default, and thinking is off)
-Object.assign(state, { reasoningEffort: "xhigh" });
+await setConfig({ reasoningEffort: "xhigh" });
 requests.length = 0;
 baseCalls = 0;
 chunks = await runWaterfall(fakeOptions);
@@ -590,7 +656,7 @@ assert.equal(requests.length, 1);
 assert.equal("reasoning_effort" in requests[0].body, false);
 
 // auto → passthrough: the stock adapter is used, effort never touches the wire
-state.mode = "auto";
+await setConfig({ mode: "auto" });
 requests.length = 0;
 baseCalls = 0;
 chunks = await runWaterfall(fakeOptions);
@@ -598,8 +664,11 @@ chunks = [...validateStream(chunks)];
 assert.equal(baseCalls, 1);
 assert.equal(requests.length, 0);
 
+// ── write discipline ───────────────────────────────────────────────────
+assert.deepEqual(violations, [], "only volatile fields are ever written back");
+
 // ── done ───────────────────────────────────────────────────────────────
 server.close();
-console.log("PASS: all thinking-mode plugin integration tests passed");
-console.log(`  - ${requests.length} direct requests captured, ${baseCalls} passthroughs in the last case`);
+console.log(`PASS: all thinking-mode plugin integration tests passed`);
+console.log(`  - ${writes.length} config writes, ${requests.length} direct requests in the last case, ${baseCalls} passthroughs`);
 process.exit(0);
