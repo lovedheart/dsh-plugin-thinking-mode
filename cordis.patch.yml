@@ -4,11 +4,12 @@
 #
 # The plugin registers:
 #   - a `thinking_mode` tool the model (or user, via chat) can call:
-#     get / on / off / auto / toggle
+#     get / on / off / auto / adaptive / toggle
 #   - a `thinking-mode` settings section (persisted in settings.yaml,
 #     live-applied, rendered in the Web UI settings page)
 #   - a system-prompt section that reports the current mode every turn
-#   - an `llm/stream` waterfall intercept: when the mode is 'on' or 'off'
+#   - an `llm/stream` waterfall intercept: when the mode is 'on', 'off', or
+#     'adaptive' (per-request heuristic + model-hint decision, see README)
 #     and the request targets a matching model, the plugin routes the
 #     call through its own OpenAI-compatible client that adds
 #     chat_template_kwargs.enable_thinking to the request body. In 'auto'

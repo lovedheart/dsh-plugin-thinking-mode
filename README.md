@@ -11,7 +11,7 @@ DeepSeek Harness 插件：为 **Qwen3 系列模型**（Qwen3.8-27B 等，经 Ope
 
 | 组件 | 说明 |
 | --- | --- |
-| `thinking_mode` 工具 | 模型或用户可调用：`get` / `on` / `off` / `auto` / `toggle`，并可**可选带 `reasoningEffort` 参数**（`xhigh` / `medium` / `low`）在同一调用里改推理深度、**可选带 `preserveThinking` 参数**（布尔）在同一调用里改是否保留历史思考内容（见下节）。输出当前模式、说明、是否变更、两套采样预设、当前 `reasoningEffort`、当前 `preserveThinking`，以及默认模型路由上拦截是否生效（`interceptActive`）。 |
+| `thinking_mode` 工具 | 模型或用户可调用：`get` / `on` / `off` / `auto` / `adaptive` / `toggle`，并可**可选带 `reasoningEffort` 参数**（`xhigh` / `medium` / `low`）在同一调用里改推理深度、**可选带 `preserveThinking` 参数**（布尔）在同一调用里改是否保留历史思考内容（见下节）。输出当前模式、说明、是否变更、两套采样预设、当前 `reasoningEffort`、当前 `preserveThinking`，以及默认模型路由上拦截是否生效（`interceptActive`）。 |
 | `thinking-mode` 设置节 | 持久化在 `~/.dsh/settings.yaml`，`applies: live` 即时生效，并在 Web 设置页中显示（设置页里也能直接切换，是第二个切换入口）。 |
 | 系统提示段 | 每轮重新渲染，向模型报告当前模式及可用操作（模型知道如何响应"关闭思考/打开思考"这类指令）。 |
 | `llm/stream` 拦截器 | 全局 waterfall 监听器。当模式为 `on`/`off` **且** 请求命中匹配的 provider/model 时，插件用自建的 OpenAI 兼容客户端直接发流式请求，与标准 pi-ai 请求相比的差异是请求体多了 `chat_template_kwargs.enable_thinking`、按模式的采样预设（见上表）与 `reasoning_effort`（见上节）；其余报文（消息转换、工具、usage、SSE 解析）逐字段对齐标准适配器。`auto` 模式为纯透传，零改动。 |
@@ -19,6 +19,11 @@ DeepSeek Harness 插件：为 **Qwen3 系列模型**（Qwen3.8-27B 等，经 Ope
 ### 三种模式
 
 - **auto**（默认）：完全透传，使用 provider 自身默认（Qwen3.8 默认开思考）。零风险，不影响现有行为。
+- **adaptive**：插件**逐请求自动决定** `enable_thinking`——对每次模型调用按以下顺序判定（确定性、写日志）：
+  1. **模型显式信号**：最近一条 assistant 消息里的 `thinking_mode` 工具调用带了 `thinking="thinking"` / `thinking="fast"` 参数 → 强制开 / 关（agent 可在回合内自主覆盖，且下一次调用生效）；
+  2. **启发式**：末条用户消息是确认语/极简短句（≤`shortMessageChars`，默认 40 字符）且不含复杂关键词 → 关；含路径引用 → 关；连续工具结果 ≥`toolRunThinking`（默认 6）→ 开；含图片 → 关；估算上下文 ≥`largeContextTokens`（默认 24000 token）→ 关；命中复杂关键词（why/debug/分析/根因…）→ 开；
+  3. 都不命中 → 按 `adaptive.defaultOn`（默认 true）。
+  判定结果通过运行时上下文回灌给模型（"Last decision: …"），agent 可随时用工具或 `thinking` 参数接管。阈值全部是 volatile 配置字段，Web 设置页可调。
 - **on**：强制 `enable_thinking: true` —— 模型先推理再回答（产生 reasoning 内容）。
 - **off**：强制 `enable_thinking: false` —— 直接回答，更快更省（实测 27B 上约 4 倍响应事件数差异，token 更少）。
 
@@ -123,7 +128,7 @@ dsh plugin --profile web add dsh-plugin-thinking-mode
 
 | 字段 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
-| `defaultMode` | `"auto" \| "on" \| "off"` | `"auto"` | 用户未显式选择前的模式 |
+| `defaultMode` | `"auto" \| "on" \| "off" \| "adaptive"` | `"auto"` | 用户未显式选择前的模式 |
 | `modelPatterns` | `string[]` | `["qwen"]` | 对模型 id 做不区分大小写的子串匹配；只有命中的模型才会被拦截 |
 | `applySampling` | `boolean` | `true` | 拦截时是否按模式强制官方推荐采样参数 |
 | `sampling` | 对象 | 见上表 | 两套预设 `thinking` / `instruct`，各含 6 个采样字段（Web 设置页可改） |

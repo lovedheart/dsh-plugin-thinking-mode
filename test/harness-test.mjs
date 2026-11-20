@@ -80,7 +80,7 @@ const baseURL = `http://127.0.0.1:${server.address().port}/v1`;
 // reproduced here so the plugin under test is exercised exactly as the host
 // would exercise it.
 const ENTRY_ID = "thinking-mode";
-const entryRaw = { defaultMode: "auto", modelPatterns: ["qwen"] };
+const entryRaw = { defaultMode: "adaptive", modelPatterns: ["qwen"] };
 const entryConfig = plugin.Config["~standard"].validate(entryRaw).value;
 
 let revision = 0;
@@ -157,6 +157,12 @@ assert.deepEqual(plugin.inject, ["tools", "systemPrompt", "settings"]);
 // state fields are volatile references; the rest are ordinary configuration.
 const parsed = plugin.Config["~standard"].validate({}).value;
 assert.equal(parsed.defaultMode, "auto");
+assert.deepEqual(parsed.adaptive.get(), {
+  defaultOn: true,
+  shortMessageChars: 40,
+  toolRunThinking: 6,
+  largeContextTokens: 24000,
+});
 assert.equal(parsed.mode.get(), undefined, "no stored mode until the user chooses one");
 assert.deepEqual(parsed.modelPatterns, ["qwen"]);
 assert.equal(parsed.applySampling.get(), true);
@@ -192,9 +198,10 @@ assert.equal(contexts[0].name, "thinking-mode:state");
 const tool = tools[0];
 
 let out = await tool.execute({ action: "get" });
-assert.equal(out.mode, "auto");
+assert.equal(out.mode, "adaptive", "entry defaultMode drives the initial mode");
 assert.equal(out.changed, false);
-assert.equal(out.interceptActive, false);
+assert.equal(out.interceptActive, true, "intercept active for the adaptive default route");
+assert.equal(out.adaptiveDecision, null, "no decision before the first model call");
 assert.equal(out.sampling.applySampling, true);
 assert.equal(out.sampling.thinking.temperature, 1.0);
 assert.equal(out.sampling.instruct.presence_penalty, 1.5);
@@ -268,7 +275,7 @@ assert.match(contexts[0].text(), /Current mode: on/);
 assert.match(contexts[0].text(), /Current reasoning_effort: low/);
 
 out = await tool.execute({ action: "toggle" });
-assert.equal(out.mode, "off");
+assert.equal(out.mode, "adaptive");
 
 out = await tool.execute({ action: "auto" });
 assert.equal(out.mode, "auto");
@@ -622,7 +629,6 @@ assert.ok(imageMsg.content[1].image_url.url.startsWith("data:image/png;base64,")
 
 // ── case 9: reasoning_effort behavior matrix ───────────────────────────
 serverState.sse = SSE_TEXT;
-
 // on + low → sent (explicit non-default)
 await setConfig({ mode: "on", reasoningEffort: "low" });
 requests.length = 0;
@@ -663,6 +669,101 @@ chunks = await runWaterfall(fakeOptions);
 chunks = [...validateStream(chunks)];
 assert.equal(baseCalls, 1);
 assert.equal(requests.length, 0);
+
+// ── case 10: adaptive mode decisions ───────────────────────────────────
+await setConfig({ mode: "adaptive", reasoningEffort: "xhigh" });
+serverState.sse = SSE_TEXT;
+
+// 10a: short simple last message → thinking OFF (instruct sampling, no effort)
+const shortOptions = { ...fakeOptions, messages: [{ id: "s1", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "ok thanks" }] }] };
+requests.length = 0;
+baseCalls = 0;
+chunks = [...validateStream(await runWaterfall(shortOptions))];
+assert.equal(baseCalls, 0, "adaptive routes directly");
+assert.equal(requests.length, 1);
+assert.deepEqual(requests[0].body.chat_template_kwargs, { enable_thinking: false, preserve_thinking: false });
+assert.equal(requests[0].body.presence_penalty, 1.5, "instruct preset applied");
+out = await tool.execute({ action: "get" });
+assert.deepEqual(out.adaptiveDecision, { on: false, reason: "acknowledgement" });
+
+// 10b: complex question → thinking ON (thinking preset, effort sent)
+const complexOptions = { ...fakeOptions, messages: [{ id: "s2", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "Why does the interceptor crash on startup? Please debug and fix the root cause." }] }] };
+requests.length = 0;
+chunks = [...validateStream(await runWaterfall(complexOptions))];
+assert.equal(requests.length, 1);
+assert.deepEqual(requests[0].body.chat_template_kwargs, { enable_thinking: true, preserve_thinking: false });
+assert.equal(requests[0].body.temperature, 1.0);
+assert.equal(requests[0].body.reasoning_effort, "xhigh");
+out = await tool.execute({ action: "get" });
+assert.equal(out.adaptiveDecision.on, true);
+assert.equal(out.adaptiveDecision.reason, "complex-keywords");
+
+// 10c: model hint via a thinking_mode tool call with thinking="fast" → off
+const hintedOptions = {
+  ...fakeOptions,
+  messages: [
+    fakeOptions.messages[0],
+    {
+      id: "m5",
+      role: "assistant",
+      source: { kind: "model", provider: "sglang", model: "Qwen3.8-27B" },
+      content: [
+        { type: "tool-call", id: "call_h", name: "thinking_mode", arguments: '{"action":"get","thinking":"fast"}' },
+      ],
+    },
+    {
+      id: "m6",
+      role: "user",
+      source: { kind: "tool", callId: "call_h" },
+      content: [{ type: "tool-result", toolCallId: "call_h", content: [{ type: "text", text: "adaptive" }] }],
+    },
+  ],
+};
+requests.length = 0;
+chunks = [...validateStream(await runWaterfall(hintedOptions))];
+assert.equal(requests.length, 1);
+assert.deepEqual(requests[0].body.chat_template_kwargs, { enable_thinking: false, preserve_thinking: false });
+out = await tool.execute({ action: "get" });
+assert.deepEqual(out.adaptiveDecision, { on: false, reason: "model-hint:fast" });
+
+// 10d: model hint thinking="thinking" beats the short-message heuristic
+const hintedOn = {
+  ...shortOptions,
+  messages: [
+    {
+      id: "m7",
+      role: "assistant",
+      source: { kind: "model", provider: "sglang", model: "Qwen3.8-27B" },
+      content: [
+        { type: "tool-call", id: "call_h2", name: "thinking_mode", arguments: '{"action":"get","thinking":"thinking"}' },
+      ],
+    },
+    {
+      id: "m8",
+      role: "user",
+      source: { kind: "tool", callId: "call_h2" },
+      content: [{ type: "tool-result", toolCallId: "call_h2", content: [{ type: "text", text: "adaptive" }] }],
+    },
+  ],
+};
+requests.length = 0;
+chunks = [...validateStream(await runWaterfall(hintedOn))];
+assert.equal(requests.length, 1);
+assert.deepEqual(requests[0].body.chat_template_kwargs, { enable_thinking: true, preserve_thinking: false });
+out = await tool.execute({ action: "get" });
+assert.deepEqual(out.adaptiveDecision, { on: true, reason: "model-hint:thinking" });
+
+// 10e: large context → off even for a medium message
+await setConfig({ adaptive: { defaultOn: true, shortMessageChars: 40, toolRunThinking: 6, largeContextTokens: 10 } });
+requests.length = 0;
+chunks = [...validateStream(await runWaterfall(shortOptions))];
+assert.equal(requests.length, 1);
+assert.deepEqual(requests[0].body.chat_template_kwargs, { enable_thinking: false, preserve_thinking: false });
+out = await tool.execute({ action: "get" });
+assert.equal(out.adaptiveDecision.on, false);
+assert.match(out.adaptiveDecision.reason, /^acknowledgement|^large-context/);
+// restore defaults
+await setConfig({ adaptive: { defaultOn: true, shortMessageChars: 40, toolRunThinking: 6, largeContextTokens: 24000 } });
 
 // ── write discipline ───────────────────────────────────────────────────
 assert.deepEqual(violations, [], "only volatile fields are ever written back");
