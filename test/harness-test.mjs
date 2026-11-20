@@ -277,6 +277,12 @@ assert.match(contexts[0].text(), /Current reasoning_effort: low/);
 out = await tool.execute({ action: "toggle" });
 assert.equal(out.mode, "adaptive");
 
+// The adaptive context must be byte-stable across calls (see the check after
+// the waterfall helpers below): the host re-renders the dynamic runtime-context
+// snapshot on every step and appends a new tail message whenever its text
+// changes, so a per-call decision echo costs an extra prompt block per call.
+assert.doesNotMatch(contexts[0].text(), /Last decision:/, "no per-call decision echo by default");
+
 out = await tool.execute({ action: "auto" });
 assert.equal(out.mode, "auto");
 assert.equal(out.changed, true);
@@ -764,6 +770,25 @@ assert.equal(out.adaptiveDecision.on, false);
 assert.match(out.adaptiveDecision.reason, /^acknowledgement|^large-context/);
 // restore defaults
 await setConfig({ adaptive: { defaultOn: true, shortMessageChars: 40, toolRunThinking: 6, largeContextTokens: 24000 } });
+
+// 10f: the adaptive runtime-context text is byte-stable across decisions.
+// The host re-renders the dynamic context snapshot every step and appends a
+// new tail user message on ANY text change (dsh-agent-loop
+// RuntimeContextProjection.project), so a per-call decision echo would put a
+// fresh block at the end of the prompt on every model call.
+await setConfig({ mode: "adaptive" });
+const ctxBefore = contexts[0].text();
+assert.doesNotMatch(ctxBefore, /Last decision:/, "decision echo off by default");
+requests.length = 0;
+await runWaterfall(complexOptions); // → thinking ON
+assert.equal(contexts[0].text(), ctxBefore, "no text change after an on-decision");
+await runWaterfall(shortOptions); // → thinking OFF
+assert.equal(contexts[0].text(), ctxBefore, "no text change after an off-decision");
+// Opting out restores the echo, and it tracks the latest decision.
+await setConfig({ stableAdaptiveContext: false });
+assert.match(contexts[0].text(), /Last decision: enable_thinking=false \(acknowledgement\)/);
+await setConfig({ stableAdaptiveContext: true });
+assert.equal(contexts[0].text(), ctxBefore);
 
 // ── write discipline ───────────────────────────────────────────────────
 assert.deepEqual(violations, [], "only volatile fields are ever written back");

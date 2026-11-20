@@ -23,7 +23,7 @@ DeepSeek Harness 插件：为 **Qwen3 系列模型**（Qwen3.8-27B 等，经 Ope
   1. **模型显式信号**：最近一条 assistant 消息里的 `thinking_mode` 工具调用带了 `thinking="thinking"` / `thinking="fast"` 参数 → 强制开 / 关（agent 可在回合内自主覆盖，且下一次调用生效）；
   2. **启发式**：末条用户消息是确认语/极简短句（≤`shortMessageChars`，默认 40 字符）且不含复杂关键词 → 关；含路径引用 → 关；连续工具结果 ≥`toolRunThinking`（默认 6）→ 开；含图片 → 关；估算上下文 ≥`largeContextTokens`（默认 24000 token）→ 关；命中复杂关键词（why/debug/分析/根因…）→ 开；
   3. 都不命中 → 按 `adaptive.defaultOn`（默认 true）。
-  判定结果通过运行时上下文回灌给模型（"Last decision: …"），agent 可随时用工具或 `thinking` 参数接管。阈值全部是 volatile 配置字段，Web 设置页可调。
+  判定结果默认**不**逐次回灌给模型——`stableAdaptiveContext`（默认 `true`）会把运行时上下文里的 "Last decision: …" 一句去掉：宿主每步都重渲染动态上下文，文本一变就在提示词尾部追加一条新的 user 消息（`dsh-agent-loop` 的 `RuntimeContextProjection.project`），逐次变化的判定回显等于每次调用多一个提示块。它只是遥测，判定本身照常生效、照常写日志；agent 仍可用 `thinking_mode` 工具或 `thinking` 参数接管。设 `stableAdaptiveContext: false` 可恢复回显。阈值全部是 volatile 配置字段，Web 设置页可调。
 - **on**：强制 `enable_thinking: true` —— 模型先推理再回答（产生 reasoning 内容）。
 - **off**：强制 `enable_thinking: false` —— 直接回答，更快更省（实测 27B 上约 4 倍响应事件数差异，token 更少）。
 
@@ -134,6 +134,7 @@ dsh plugin --profile web add dsh-plugin-thinking-mode
 | `sampling` | 对象 | 见上表 | 两套预设 `thinking` / `instruct`，各含 6 个采样字段（Web 设置页可改） |
 | `defaultReasoningEffort` | `"xhigh" \| "medium" \| "low"` | `"xhigh"` | 用户未显式选择前的推理深度档位 |
 | `preserveThinking`（设置节） | `boolean` | `false` | 思考开启时是否保留历史 `reasoning_content`（思考关闭时恒为 `false`） |
+| `stableAdaptiveContext`（设置节） | `boolean` | `true` | `adaptive` 模式下运行时上下文是否省略 "Last decision: …" 一句，保持文本逐次不变以免每步追加上下文块 |
 
 运行时状态（`thinking-mode` 设置节的 `mode`）优先于 `defaultMode`。
 
