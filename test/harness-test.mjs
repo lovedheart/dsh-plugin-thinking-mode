@@ -203,7 +203,7 @@ let out = await tool.execute({ action: "get" });
 assert.equal(out.mode, "adaptive", "entry defaultMode drives the initial mode");
 assert.equal(out.changed, false);
 assert.equal(out.interceptActive, true, "intercept active for the adaptive default route");
-assert.equal(out.adaptiveDecision, null, "no decision before the first model call");
+assert.equal(out.adaptiveDecision, undefined, "no decision key before the first model call");
 assert.equal(out.sampling.applySampling, true);
 assert.equal(out.sampling.thinking.temperature, 1.0);
 assert.equal(out.sampling.instruct.presence_penalty, 1.5);
@@ -556,6 +556,18 @@ requests.length = 0;
 chunks = [...validateStream(await runWaterfall({ ...fakeOptions, sessionId: "" }))];
 assert.equal(requests.length, 1);
 assert.equal("session_id" in requests[0].body, false, "empty sessionId sends no session_id");
+// Numeric session ids: only positive integers are usable. 0 / -1 / 1.5 / NaN
+// are junk identifiers that would shard or collide the server-side session
+// cache if stringified and sent.
+for (const junk of [0, -1, 1.5, Number.NaN]) {
+  requests.length = 0;
+  chunks = [...validateStream(await runWaterfall({ ...fakeOptions, sessionId: junk }))];
+  assert.equal(requests.length, 1);
+  assert.equal("session_id" in requests[0].body, false, `numeric sessionId ${junk} sends no session_id`);
+}
+requests.length = 0;
+chunks = [...validateStream(await runWaterfall({ ...fakeOptions, sessionId: 42 }))];
+assert.equal(requests[0].body.session_id, "42", "positive integer sessionId is sent as a string");
 // sessionAffinity: false opts the field out entirely (strict gateways that
 // 400 on unknown body fields).
 await setConfig({ sessionAffinity: false });
@@ -564,7 +576,6 @@ chunks = [...validateStream(await runWaterfall(fakeOptions))];
 assert.equal(requests.length, 1);
 assert.equal("session_id" in requests[0].body, false, "sessionAffinity false sends no session_id");
 await setConfig({ sessionAffinity: true });
-requests.length = 0;
 assert.deepEqual(
   chunks.map((c) => c.type),
   ["block-start", "reasoning-delta", "block-start", "text-delta", "block-end", "block-end", "usage", "finish"],
@@ -809,6 +820,25 @@ assert.match(out.adaptiveDecision.reason, /^acknowledgement|^large-context/);
 // restore defaults
 await setConfig({ adaptive: { defaultOn: true, shortMessageChars: 40, toolRunThinking: 6, largeContextTokens: 24000 } });
 
+// 10f: the adaptive runtime-context text is byte-stable across decisions.
+// The host re-renders the dynamic context snapshot every step and appends a
+// new tail user message on ANY text change (dsh-agent-loop
+// RuntimeContextProjection.project), so a per-call decision echo would put a
+// fresh block at the end of the prompt on every model call.
+await setConfig({ mode: "adaptive" });
+const ctxBefore = contexts[0].text();
+assert.doesNotMatch(ctxBefore, /Last decision:/, "decision echo off by default");
+requests.length = 0;
+await runWaterfall(complexOptions); // → thinking ON
+assert.equal(contexts[0].text(), ctxBefore, "no text change after an on-decision");
+await runWaterfall(shortOptions); // → thinking OFF
+assert.equal(contexts[0].text(), ctxBefore, "no text change after an off-decision");
+// Opting out restores the echo, and it tracks the latest decision.
+await setConfig({ stableAdaptiveContext: false });
+assert.match(contexts[0].text(), /Last decision: enable_thinking=false \(acknowledgement\)/);
+await setConfig({ stableAdaptiveContext: true });
+assert.equal(contexts[0].text(), ctxBefore);
+
 // 10g: harness scaffold tail turns (system-reminder wrapper + runtime-context
 // snapshot) must not hijack the heuristics — the real prompt decides. Without
 // the scaffold filter the snapshot's "- Workspace: /home/…" line makes every
@@ -873,25 +903,101 @@ assert.deepEqual(requests[0].body.chat_template_kwargs, { enable_thinking: true,
 out = await tool.execute({ action: "get" });
 assert.deepEqual(out.adaptiveDecision, { on: true, reason: "long-tool-run" }, "snapshot tail must not break the tool-run count");
 
-
-// 10f: the adaptive runtime-context text is byte-stable across decisions.
-// The host re-renders the dynamic context snapshot every step and appends a
-// new tail user message on ANY text change (dsh-agent-loop
-// RuntimeContextProjection.project), so a per-call decision echo would put a
-// fresh block at the end of the prompt on every model call.
-await setConfig({ mode: "adaptive" });
-const ctxBefore = contexts[0].text();
-assert.doesNotMatch(ctxBefore, /Last decision:/, "decision echo off by default");
+// 10i: scaffold detection must be per-text-block and LINE-START only.
+// (a) A marker quoted mid-sentence is the user's own text: cutting there
+// would erase the user's path mention and the question, flipping the
+// decision from path-reference to short-simple-message.
+const quotedMarker = {
+  ...fakeOptions,
+  messages: [
+    {
+      id: "qt1",
+      role: "user",
+      source: { kind: "user" },
+      content: [
+        { type: "text", text: "请帮我看看这段报错：\"Current runtime context. stale path: /var/notes/todo.md\"，定位根因" },
+        { type: "text", text: "第二段同样要保留：Before marker text" },
+      ],
+    },
+  ],
+};
 requests.length = 0;
-await runWaterfall(complexOptions); // → thinking ON
-assert.equal(contexts[0].text(), ctxBefore, "no text change after an on-decision");
-await runWaterfall(shortOptions); // → thinking OFF
-assert.equal(contexts[0].text(), ctxBefore, "no text change after an off-decision");
-// Opting out restores the echo, and it tracks the latest decision.
-await setConfig({ stableAdaptiveContext: false });
-assert.match(contexts[0].text(), /Last decision: enable_thinking=false \(acknowledgement\)/);
-await setConfig({ stableAdaptiveContext: true });
-assert.equal(contexts[0].text(), ctxBefore);
+chunks = [...validateStream(await runWaterfall(quotedMarker))];
+assert.equal(requests.length, 1);
+out = await tool.execute({ action: "get" });
+assert.equal(out.adaptiveDecision.reason, "path-reference", "a mid-sentence quoted marker must not cut the user's text");
+assert.equal(out.adaptiveDecision.on, false);
+// (b) A scaffold text block must not swallow the user's text held in a LATER
+// block of the same message: the decision comes from the real question.
+const scaffoldBlockThenUserText = {
+  ...fakeOptions,
+  messages: [
+    {
+      id: "qt2",
+      role: "user",
+      source: { kind: "user" },
+      content: [
+        { type: "text", text: "Current runtime context. This snapshot supersedes earlier snapshots.\n- Workspace: /home/lovedheart/Documents/demo" },
+        { type: "text", text: "Why does startup crash with an exception? debug and fix the root cause." },
+      ],
+    },
+  ],
+};
+requests.length = 0;
+chunks = [...validateStream(await runWaterfall(scaffoldBlockThenUserText))];
+out = await tool.execute({ action: "get" });
+assert.equal(out.adaptiveDecision.reason, "complex-keywords", "only the scaffold block is cut; the user's block decides");
+assert.equal(out.adaptiveDecision.on, true);
+
+// 10j: a model-hint lives until the next REAL user prompt; a trailing
+// scaffold turn must not consume it (it rides in after every step), and a
+// real prompt must.
+const hintPlusScaffold = {
+  ...fakeOptions,
+  messages: [
+    ...hintedOptions.messages,
+    { id: "sc-hint", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "Current runtime context. This snapshot supersedes earlier snapshots.\n- Workspace: /home/lovedheart/Documents/demo" }] },
+  ],
+};
+requests.length = 0;
+chunks = [...validateStream(await runWaterfall(hintPlusScaffold))];
+out = await tool.execute({ action: "get" });
+assert.equal(out.adaptiveDecision.reason, "model-hint:fast", "a scaffold turn must not consume the hint");
+const hintThenRealUser = {
+  ...fakeOptions,
+  messages: [
+    ...hintedOptions.messages,
+    { id: "ru1", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "再帮我 debug 一下登录接口，定位报错根因并给出修复方案。" }] },
+  ],
+};
+requests.length = 0;
+chunks = [...validateStream(await runWaterfall(hintThenRealUser))];
+out = await tool.execute({ action: "get" });
+assert.equal(out.adaptiveDecision.reason, "complex-keywords", "a real user prompt consumes the hint");
+assert.equal(out.adaptiveDecision.on, true);
+
+// 10k: line-start detection must accept CR as well as LF. Lone-CR text (old
+// Mac / mixed-EOL paste) was the real gap: the marker stayed invisible, the
+// snapshot's Workspace path hijacked the decision as path-reference instead
+// of the user's short prompt deciding. CRLF rides on the pre-existing \n case.
+for (const [eol, label] of [["\r\n", "CRLF"], ["\r", "lone-CR"]]) {
+  const crlfScaffold = {
+    ...fakeOptions,
+    messages: [
+      {
+        id: "crlf1",
+        role: "user",
+        source: { kind: "user" },
+        content: [{ type: "text", text: `帮我修复报错：${eol}Current runtime context. This snapshot supersedes earlier snapshots.${eol}- Workspace: /home/lovedheart/Documents/demo${eol}- Time: 2026-11-22` }],
+      },
+    ],
+  };
+  requests.length = 0;
+  chunks = [...validateStream(await runWaterfall(crlfScaffold))];
+  out = await tool.execute({ action: "get" });
+  assert.equal(out.adaptiveDecision.reason, "short-simple-message", `a ${label}-preceded scaffold marker must still be cut`);
+  assert.equal(out.adaptiveDecision.on, false);
+}
 
 // ── write discipline ───────────────────────────────────────────────────
 assert.deepEqual(violations, [], "only volatile fields are ever written back");
