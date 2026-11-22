@@ -14,7 +14,7 @@ DeepSeek Harness 插件：为 **Qwen3 系列模型**（Qwen3.8-27B 等，经 Ope
 | `thinking_mode` 工具 | 模型或用户可调用：`get` / `on` / `off` / `auto` / `adaptive` / `toggle`，并可**可选带 `reasoningEffort` 参数**（`xhigh` / `medium` / `low`）在同一调用里改推理深度、**可选带 `preserveThinking` 参数**（布尔）在同一调用里改是否保留历史思考内容（见下节）。输出当前模式、说明、是否变更、两套采样预设、当前 `reasoningEffort`、当前 `preserveThinking`，以及默认模型路由上拦截是否生效（`interceptActive`）。 |
 | `thinking-mode` 设置节 | 持久化在 `~/.dsh/settings.yaml`，`applies: live` 即时生效，并在 Web 设置页中显示（设置页里也能直接切换，是第二个切换入口）。 |
 | 系统提示段 | 每轮重新渲染，向模型报告当前模式及可用操作（模型知道如何响应"关闭思考/打开思考"这类指令）。 |
-| `llm/stream` 拦截器 | 全局 waterfall 监听器。当模式为 `on`/`off` **且** 请求命中匹配的 provider/model 时，插件用自建的 OpenAI 兼容客户端直接发流式请求，与标准 pi-ai 请求相比的差异是请求体多了 `chat_template_kwargs.enable_thinking`、按模式的采样预设（见上表）与 `reasoning_effort`（见上节）；其余报文（消息转换、工具、usage、SSE 解析）逐字段对齐标准适配器。`auto` 模式为纯透传，零改动。 |
+| `llm/stream` 拦截器 | 全局 waterfall 监听器。当模式为 `on`/`off` **且** 请求命中匹配的 provider/model 时，插件用自建的 OpenAI 兼容客户端直接发流式请求，与标准 pi-ai 请求相比的差异是请求体多了 `chat_template_kwargs.enable_thinking`、按模式的采样预设（见上表）、`reasoning_effort`（见上节）与 `session_id`（会话亲和，见上表；`sessionAffinity: false` 可关闭）；其余报文（消息转换、工具、usage、SSE 解析）逐字段对齐标准适配器。`auto` 模式为纯透传，零改动。 |
 
 ### 三种模式
 

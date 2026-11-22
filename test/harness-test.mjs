@@ -185,6 +185,8 @@ assert.deepEqual(parsed.sampling.get().instruct, {
 assert.equal(parsed.defaultReasoningEffort, "xhigh");
 assert.equal(parsed.reasoningEffort.get(), undefined, "no stored effort until the user chooses one");
 assert.equal(parsed.preserveThinking.get(), false);
+assert.equal(parsed.sessionAffinity.get(), true, "session_id rides by default");
+assert.equal(parsed.stableAdaptiveContext.get(), true, "adaptive context is byte-stable by default");
 
 plugin.apply(ctx, entryConfig);
 
@@ -540,9 +542,28 @@ assert.equal(requests[0].body.session_id, "sess_test_42");
 // No sessionId in the request → the field is absent entirely (not "", not
 // "undefined"), so other OpenAI-compatible endpoints see an unchanged body.
 requests.length = 0;
-await runWaterfall({ ...fakeOptions, sessionId: undefined });
+chunks = [...validateStream(await runWaterfall({ ...fakeOptions, sessionId: undefined }))];
 assert.equal(requests.length, 1);
 assert.equal("session_id" in requests[0].body, false, "absent sessionId sends no session_id");
+// Falsy-but-defined sessionId values must also send nothing: String(null) or
+// String(false) would put a shared bogus id in the body and collide every
+// such conversation on one SGLang session cache key.
+requests.length = 0;
+chunks = [...validateStream(await runWaterfall({ ...fakeOptions, sessionId: null }))];
+assert.equal(requests.length, 1);
+assert.equal("session_id" in requests[0].body, false, "null sessionId sends no session_id");
+requests.length = 0;
+chunks = [...validateStream(await runWaterfall({ ...fakeOptions, sessionId: "" }))];
+assert.equal(requests.length, 1);
+assert.equal("session_id" in requests[0].body, false, "empty sessionId sends no session_id");
+// sessionAffinity: false opts the field out entirely (strict gateways that
+// 400 on unknown body fields).
+await setConfig({ sessionAffinity: false });
+requests.length = 0;
+chunks = [...validateStream(await runWaterfall(fakeOptions))];
+assert.equal(requests.length, 1);
+assert.equal("session_id" in requests[0].body, false, "sessionAffinity false sends no session_id");
+await setConfig({ sessionAffinity: true });
 requests.length = 0;
 assert.deepEqual(
   chunks.map((c) => c.type),
@@ -787,6 +808,71 @@ assert.equal(out.adaptiveDecision.on, false);
 assert.match(out.adaptiveDecision.reason, /^acknowledgement|^large-context/);
 // restore defaults
 await setConfig({ adaptive: { defaultOn: true, shortMessageChars: 40, toolRunThinking: 6, largeContextTokens: 24000 } });
+
+// 10g: harness scaffold tail turns (system-reminder wrapper + runtime-context
+// snapshot) must not hijack the heuristics — the real prompt decides. Without
+// the scaffold filter the snapshot's "- Workspace: /home/…" line makes every
+// live request look like a `path-reference` (thinking silently off).
+const scaffoldTurns = [
+  { id: "sc1", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "<system-reminder>\nWorkspace instructions may be relevant.\n</system-reminder>" }] },
+  { id: "sc2", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "Current runtime context. This snapshot supersedes earlier runtime-context snapshots.\n- Workspace: /home/lovedheart/Documents/demo\n- Time: 2026-11-22" }] },
+];
+const scaffoldedComplex = {
+  ...fakeOptions,
+  messages: [
+    { id: "s3", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "Why does the interceptor crash on startup? Please debug and fix the root cause." }] },
+    ...scaffoldTurns,
+  ],
+};
+requests.length = 0;
+chunks = [...validateStream(await runWaterfall(scaffoldedComplex))];
+assert.equal(requests.length, 1);
+assert.deepEqual(requests[0].body.chat_template_kwargs, { enable_thinking: true, preserve_thinking: false });
+out = await tool.execute({ action: "get" });
+assert.equal(out.adaptiveDecision.reason, "complex-keywords", "scaffold turns must not hijack the decision");
+// A snapshot appended right after the user's own text (same turn) is also cut.
+const inlineScaffold = {
+  ...fakeOptions,
+  messages: [
+    { id: "s4", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "Why does the interceptor crash on startup? Please debug and fix the root cause.\n\nCurrent runtime context. This snapshot supersedes earlier snapshots.\n- Workspace: /home/lovedheart/Documents/demo" }] },
+  ],
+};
+requests.length = 0;
+chunks = [...validateStream(await runWaterfall(inlineScaffold))];
+assert.equal(requests.length, 1);
+assert.deepEqual(requests[0].body.chat_template_kwargs, { enable_thinking: true, preserve_thinking: false });
+out = await tool.execute({ action: "get" });
+assert.equal(out.adaptiveDecision.reason, "complex-keywords", "inline snapshot must not hijack the decision");
+
+// 10h: long tool run → thinking ON even though the only real prompt is a
+// short one, because the trailing runtime-context snapshot must not break
+// the trailing-tool-result count. Six assistant tool-call / user tool-result
+// pairs after a short prompt, snapshot last.
+const toolRunMessages = [
+  { id: "s5", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "跑一遍测试。" }] },
+];
+for (let t = 0; t < 6; t += 1) {
+  toolRunMessages.push({
+    id: `a${t}`,
+    role: "assistant",
+    source: { kind: "model", provider: "sglang", model: "Qwen3.8-27B" },
+    content: [{ type: "tool-call", id: `call_r${t}`, name: "execute_shell_command", arguments: '{"command":"true"}' }],
+  });
+  toolRunMessages.push({
+    id: `u${t}`,
+    role: "user",
+    source: { kind: "tool", callId: `call_r${t}` },
+    content: [{ type: "tool-result", toolCallId: `call_r${t}`, content: [{ type: "text", text: "ok" }] }],
+  });
+}
+toolRunMessages.push(...scaffoldTurns.map((turn, i) => ({ ...turn, id: `sc-run-${i}` })));
+requests.length = 0;
+chunks = [...validateStream(await runWaterfall({ ...fakeOptions, messages: toolRunMessages }))];
+assert.equal(requests.length, 1);
+assert.deepEqual(requests[0].body.chat_template_kwargs, { enable_thinking: true, preserve_thinking: false });
+out = await tool.execute({ action: "get" });
+assert.deepEqual(out.adaptiveDecision, { on: true, reason: "long-tool-run" }, "snapshot tail must not break the tool-run count");
+
 
 // 10f: the adaptive runtime-context text is byte-stable across decisions.
 // The host re-renders the dynamic context snapshot every step and appends a
