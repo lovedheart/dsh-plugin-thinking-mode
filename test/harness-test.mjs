@@ -322,6 +322,7 @@ await setConfig({ reasoningEffort: "xhigh" });
 const fakeOptions = {
   provider: "sglang",
   model: "Qwen3.8-27B",
+  sessionId: "sess_test_42",
   system: "You are a test agent.",
   messages: [
     {
@@ -457,6 +458,13 @@ assert.equal(req.body.max_tokens, 1000);
 assert.equal(req.body.tools.length, 1);
 assert.equal(req.body.tools[0].type, "function");
 assert.equal(req.body.tools[0].function.name, "get_weather");
+// Session affinity: dsh threads GenerateOptions.sessionId through to every
+// request; the local sglang fork's session radix cache reads `session_id`
+// from the chat-completions BODY (entrypoints/openai/protocol.py
+// ChatCompletionRequest.session_id — same field the [PATCH session-id-body]
+// in pi-ai sets). Without it the direct route falls off the session cache and
+// re-prefills the full conversation server-side on every step.
+assert.equal(req.body.session_id, "sess_test_42", "session_id forwarded to the direct route");
 
 // wire message conversion (pi-ai parity shape)
 assert.deepEqual(req.body.messages[0], { role: "system", content: "You are a test agent." });
@@ -527,6 +535,15 @@ assert.equal(requests[0].body.presence_penalty, 0.0);
 assert.equal(requests[0].body.repetition_penalty, 1.0);
 // In on mode the (default) effort is sent explicitly.
 assert.equal(requests[0].body.reasoning_effort, "xhigh");
+// Session affinity rides on the on-mode route too.
+assert.equal(requests[0].body.session_id, "sess_test_42");
+// No sessionId in the request → the field is absent entirely (not "", not
+// "undefined"), so other OpenAI-compatible endpoints see an unchanged body.
+requests.length = 0;
+await runWaterfall({ ...fakeOptions, sessionId: undefined });
+assert.equal(requests.length, 1);
+assert.equal("session_id" in requests[0].body, false, "absent sessionId sends no session_id");
+requests.length = 0;
 assert.deepEqual(
   chunks.map((c) => c.type),
   ["block-start", "reasoning-delta", "block-start", "text-delta", "block-end", "block-end", "usage", "finish"],
