@@ -69,10 +69,11 @@ Qwen3 的 `preserve_thinking`（同样经 `chat_template_kwargs` 按请求传递
 ## 工作原理（安全性说明）
 
 1. 插件在 `llm/stream` waterfall 上注册 `global` 监听器（文档化的网关模式）。
-2. 每次模型调用时按顺序判断：模式是否 `auto`？→ provider 设置节（`llm-pi-ai`，实时读取）里该 provider 的 `api` 是否为 `openai-completions`？→ 有无 `baseURL`？→ 模型 id 是否命中 `modelPatterns`（不区分大小写子串，默认 `["qwen"]`）？→ 用户消息含图片时附件服务是否可用？
-3. 任何一项不满足 → `yield* await next()` 走标准适配器路径（**所有不确定性都退化为透传**）。
-4. 命中时直接请求 `baseURL/chat/completions`，SSE 转成协议合法的 StreamChunk 序列，并合成 pi-ai `replayState`（`kind: 'pi-ai'`, `version: 1`, `api: 'openai-completions'`），使后续轮次的历史重建与标准路径完全一致（会话回放不受影响）。
-5. 所有输出都经过 dsh-llm 全局流不变量校验（块配对、usage 唯一、finish 终止等）。
+2. 每次模型调用时按顺序判断：模式是否 `auto`？→ provider 设置节（`llm-pi-ai`，实时读取）里该 provider 的 `api` 是否为 `openai-completions`？→ 有无 `baseURL`？→ 模型 id 是否命中 `modelPatterns`（不区分大小写子串，默认 `["qwen"]`）？→ 未 offload 的图片块要求模型声明 image 输入且附件服务可用？
+3. 任何一项不满足 → `yield* await next()` 走标准适配器路径（**所有不确定性都退化为透传**）。转换阶段还会抛出 `UnsupportedHistory`（镜像未覆盖的历史形态：tool-addition/tool-removal 块、assistant 图片输出、超请求图片预算、非 user/tool 位图片等）——同样在发出任何 HTTP 请求**之前**交还标准路由。
+4. 命中时直接请求 `baseURL/chat/completions`，SSE 转成协议合法的 StreamChunk 序列，并合成 pi-ai `replayState`（嵌套 `response` 信封：`kind: 'pi-ai'`, `version: 2`, `api: 'openai-completions'`；dsh-llm-pi-ai ≥0.2 的 `readReplayState` 只接受该形态，旧的平铺 `version: 1` 会被判 `INVALID_REPLAY_STATE` 并把整轮降级为 provider-neutral 历史），使后续轮次的历史重建走原生 replay 路径。reasoning 块带 `thinkingSignature`（记录该轮推理走的 SSE 字段名），后续轮据此把 `reasoning_content` 原样回灌——与标准适配器一致。
+5. wire 转换逐字段镜像标准链路（`lib/parity.js` + `lib/messages.js`）：harness→pi 层的前导 system 折叠、assistant 历史经 replayState 重建（同模型保留 thinking、外部模型降级为 provider-neutral）、role `"tool"` 结果消息与工具名映射、`<system-reminder>` 包装的中途 system、请求图片的稳定句柄文本与像素/字节预算、pi-ai 的 `detectCompat` 旗标（`store:false`、`max_completion_tokens`、`strict` 省略、tool-call id 归一化等）。因此**切换路由本身不改变服务端看到的 prompt**，不触发 re-prefill。
+6. 所有输出都经过 dsh-llm 全局流不变量校验（块配对、usage 唯一、finish 终止等）。
 
 ## 切换为什么需要等待（延迟构成）
 
@@ -146,7 +147,7 @@ ln -s ~/.dsh/profiles/node_modules node_modules   # 开发用符号链接（已 
 npm test          # = node test/harness-test.mjs
 ```
 
-测试覆盖：Config 默认值、工具五种动作与状态迁移、系统提示动态文本、`off`/`on` 直连路由（请求体逐字段断言：`chat_template_kwargs`、工具函数形态、消息 wire 转换、鉴权头）、chunk 流语法校验（不变量规则复现）、`replayState` 精确断言、`auto`/非匹配模型透传、HTTP 500 与空响应终止、图片请求在附件服务缺省时的退化与存在时的直连。
+测试覆盖：Config 默认值、工具五种动作与状态迁移、系统提示动态文本、`off`/`on` 直连路由（请求体逐字段断言：`chat_template_kwargs`、`store:false`/`max_completion_tokens` 等 compat 体字段、工具函数形态、消息 wire 转换（含 replayState thinking 回灌、role `"tool"` 结果）、鉴权头）、chunk 流语法校验（不变量规则复现）、`replayState` 精确断言 + dsh-llm-pi-ai `readReplayState` v2 信封契约的 parity 校验（旧平铺 v1 形态被拒的回归守卫）、`auto`/非匹配模型透传、HTTP 500 与空响应终止、图片请求在附件服务缺省时的退化与存在时的直连（含稳定句柄文本断言）、parity 边缘形态（tool-addition 回交标准路由、外部 assistant 轮 thinking 降级、中途 system 的 `<system-reminder>` 包装与转义、`call|item` 形 id 归一化、offloaded 图片占位文本）、adaptive 判定的真实 role-`"tool"` 工具链计数。
 
 已验证（本机 SGLang + Qwen3.8-27B 实测）：
 
@@ -162,9 +163,11 @@ npm test          # = node test/harness-test.mjs
 ├── LICENSE               # MIT
 ├── lib/
 │   ├── index.js          # 入口：工具 + 设置节 + 系统提示段 + 安装拦截器
-│   ├── intercept.js      # llm/stream waterfall 拦截 + 路由判定
-│   ├── messages.js       # Harness 消息 → OpenAI wire 转换（对齐 pi-ai 适配器）
-│   └── stream.js         # OpenAI SSE → StreamChunk + replayState 合成
+│   ├── intercept.js      # llm/stream waterfall 拦截 + 路由判定 + compat 解析
+│   ├── messages.js       # Harness 消息 → OpenAI wire 转换（逐字段镜像标准链路）
+│   ├── parity.js         # pi-ai / dsh-llm 逐函数镜像（detectCompat、replayState 校验、图片句柄文本等）
+│   ├── adaptive.js       # adaptive 模式判定（模型 hint + 启发式）
+│   └── stream.js         # OpenAI SSE → StreamChunk + replayState 合成（含 thinkingSignature）
 └── test/
     └── harness-test.mjs  # 独立集成测试（npm test）
 ```
@@ -172,7 +175,8 @@ npm test          # = node test/harness-test.mjs
 ## 限制
 
 - 状态为实例级全局，不是每会话（v1 取舍）。
-- 仅拦截 `openai-completions` 路由的匹配模型；其他 provider/路由一律透传。
+- 拦截路由的历史 thinking 与标准适配器同规则：本插件自己写出的轮次（replayState 有效、同模型）回灌 `reasoning_content`；外部/迁移前的旧 assistant 轮没有可校验的 replayState，两条路由都会丢弃其 thinking（provider-neutral 历史），不存在插件独有的差异。唯一例外：标准路由收到**插件写出但适配器无法复核**的 replayState 时会按 `INVALID_REPLAY_STATE` 降级整轮——v1 平铺信封就是这个 bug 的来源，已修复并有回归守卫。
+- 仅拦截 `openai-completions` 路由的匹配模型；其他 provider/路由一律透传。镜像不支持的历史形态（tool-addition/removal 块、assistant 图片输出、超预算图片等）在发请求前回交标准路由（日志 `passing through`）。
 - 采样预设按 Qwen3.8 模型卡片写死为默认值；`top_k`/`min_p`/`repetition_penalty` 在 SGLang 上已验证接受，其他 OpenAI 兼容端点若不接受未知键会自行忽略（SGLang 即忽略未知键，已实测）。
 - `reasoning_effort` 当前提供三个官方档位（xhigh/medium/low）；端点还支持 none/minimal/high/max，可后续按需扩展。
-- 图片请求要求附件服务存在（dsh 标准组合默认具备）；缺失时透传。
+- 图片请求要求附件服务存在（dsh 标准组合默认具备）；缺失时透传。图片句柄文本用"无本地归一化路径"的措辞（`access` 变体需要宿主文件路径，暂未接线）；标准适配器若能给出只读归一化路径时措辞不同，切路由时该文字块会 re-prefill 一次。

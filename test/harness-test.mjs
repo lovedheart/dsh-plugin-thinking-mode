@@ -17,6 +17,14 @@
 import assert from "node:assert/strict";
 import http from "node:http";
 import * as plugin from "../lib/index.js";
+import { buildReplayState } from "../lib/stream.js";
+import {
+  normalizeToolCallId,
+  offloadedImageText,
+  readPiAiReplayState,
+  requestImageHandleText,
+  resolveCompletionsCompat,
+} from "../lib/parity.js";
 import { Context } from "@deepseek-ai/cordis";
 import { updateVolatile, volatileEntries } from "@deepseek-ai/cosmokit";
 
@@ -116,6 +124,45 @@ const piConfig = {
       api: "openai-completions",
       baseURL,
       apiKeyEnv: "TEST_THINKING_KEY",
+      models: [{ id: "Qwen3.8-27B", input: ["text", "image"] }],
+    },
+    // Same local server, but profile compat overrides on every axis the
+    // body assertions read (case 12 pins these non-default branches).
+    overrides: {
+      displayName: "Compat overrides",
+      api: "openai-completions",
+      baseURL,
+      apiKeyEnv: "TEST_THINKING_KEY",
+      compat: { supportsStore: false, maxTokensField: "max_tokens", supportsStrictMode: true },
+      models: [{ id: "Qwen3.8-27B", input: ["text"] }],
+    },
+    // Flags the wire conversion reads, all on at once (case 14).
+    fussy: {
+      displayName: "Fussy route",
+      api: "openai-completions",
+      baseURL,
+      apiKeyEnv: "TEST_THINKING_KEY",
+      compat: {
+        supportsDeveloperRole: true,
+        requiresToolResultName: true,
+        requiresAssistantAfterToolResult: true,
+        requiresNonNullAssistantContent: true,
+        requiresReasoningContentOnAssistantMessages: true,
+        requiresThinkingAsText: true,
+        requiresToolsWithToolHistory: true,
+      },
+      models: [{ id: "Qwen3.8-27B", input: ["text"], reasoning: true }],
+    },
+    // 1024-pixel budget forces the 64×64 test image down to a 32×32 request
+    // preview, pinning the requestImagePixelBudget → readImageRequest target
+    // scaling path end to end.
+    budgeted: {
+      displayName: "Pixel budget",
+      api: "openai-completions",
+      baseURL,
+      apiKeyEnv: "TEST_THINKING_KEY",
+      requestImagePixelBudget: 1024,
+      models: [{ id: "Qwen3.8-27B", input: ["text", "image"] }],
     },
   },
 };
@@ -336,7 +383,29 @@ const fakeOptions = {
     {
       id: "m2",
       role: "assistant",
-      source: { kind: "model", provider: "sglang", model: "Qwen3.8-27B" },
+      source: {
+        kind: "model",
+        provider: "sglang",
+        model: "Qwen3.8-27B",
+        // The durable replay state the direct route records on its own
+        // turns (see the chunks[13] assertions below). Matching envelope →
+        // the adapter replays this turn natively, reasoning included.
+        replayState: {
+          response: {
+            kind: "pi-ai",
+            version: 2,
+            api: "openai-completions",
+            provider: "sglang",
+            model: "Qwen3.8-27B",
+            stopReason: "toolUse",
+          },
+          blocks: [
+            { type: "text" },
+            { type: "reasoning", thinkingSignature: "reasoning_content" },
+            { type: "tool-call" },
+          ],
+        },
+      },
       content: [
         { type: "text", text: "Let me check." },
         { type: "reasoning", text: "prior thinking" },
@@ -456,10 +525,16 @@ assert.equal(req.body.presence_penalty, 1.5);
 assert.equal(req.body.repetition_penalty, 1.0);
 // Default effort (xhigh) is the provider default → not sent in off mode.
 assert.equal("reasoning_effort" in req.body, false);
-assert.equal(req.body.max_tokens, 1000);
+// Stock-route body parity (pi-ai buildParams for a local sglang route):
+// supportsStore → store:false; maxTokens rides on max_completion_tokens.
+assert.equal(req.body.max_completion_tokens, 1000);
+assert.equal("max_tokens" in req.body, false);
+assert.equal(req.body.store, false);
 assert.equal(req.body.tools.length, 1);
 assert.equal(req.body.tools[0].type, "function");
 assert.equal(req.body.tools[0].function.name, "get_weather");
+// supportsStrictMode is false for plain OpenAI-compat routes → no strict key.
+assert.equal("strict" in req.body.tools[0].function, false);
 // Session affinity: dsh threads GenerateOptions.sessionId through to every
 // request; the local sglang fork's session radix cache reads `session_id`
 // from the chat-completions BODY (entrypoints/openai/protocol.py
@@ -477,8 +552,12 @@ assert.equal(req.body.messages[2].tool_calls.length, 1);
 assert.equal(req.body.messages[2].tool_calls[0].id, "call_prev");
 assert.equal(req.body.messages[2].tool_calls[0].function.name, "get_weather");
 assert.equal(req.body.messages[2].tool_calls[0].function.arguments, '{"city":"Munich"}');
+// Same-model replayState → the thinking block is replayed as reasoning_content
+// under the recorded field (the exact shape the stock route sends).
+assert.equal(req.body.messages[2].reasoning_content, "prior thinking");
 assert.deepEqual(req.body.messages[3], { role: "tool", content: "sunny", tool_call_id: "call_prev" });
 assert.deepEqual(req.body.messages[4], { role: "user", content: "now for Berlin" });
+assert.equal(req.body.messages.length, 5, "no extra bridge messages on this route");
 
 // chunk sequence: reasoning, text, tool-call, usage, finish(tool-calls)
 assert.deepEqual(
@@ -509,14 +588,144 @@ assert.deepEqual(chunks[11].block, {
 assert.deepEqual(chunks[12].usage, { inputTokens: 100, outputTokens: 20, cacheReadTokens: 60, reasoningTokens: 8 });
 assert.deepEqual(chunks[13].reason, { kind: "tool-calls" });
 assert.deepEqual(chunks[13].replayState, {
-  kind: "pi-ai",
-  version: 1,
-  api: "openai-completions",
-  provider: "sglang",
-  model: "Qwen3.8-27B",
-  stopReason: "toolUse",
-  blocks: [{ type: "reasoning" }, { type: "text" }, { type: "tool-call" }],
+  response: {
+    kind: "pi-ai",
+    version: 2,
+    api: "openai-completions",
+    provider: "sglang",
+    model: "Qwen3.8-27B",
+    stopReason: "toolUse",
+  },
+  blocks: [
+    { type: "reasoning", thinkingSignature: "reasoning_content" },
+    { type: "text" },
+    { type: "tool-call" },
+  ],
 });
+
+// ── replay-state parity with dsh-llm-pi-ai's readReplayState contract ──
+// Mirrors the validation the installed adapter applies before replaying an
+// assistant turn (dsh-llm-pi-ai >= 0.2: a nested `response` envelope with
+// version 2). An envelope failing this check is thrown away with
+// INVALID_REPLAY_STATE and the turn degrades to provider-neutral foreign
+// history, so intercepted turns must pass it verbatim.
+function readReplayStateOrThrow(value) {
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    throw new Error("invalid pi-ai replay state: expected a replay envelope");
+  const response = value.response;
+  if (typeof response !== "object" || response === null || Array.isArray(response))
+    throw new Error("invalid pi-ai replay state: expected a response object");
+  if (response.kind !== "pi-ai") throw new Error("invalid pi-ai replay state: unknown state kind");
+  if (response.version !== 2)
+    throw new Error(`invalid pi-ai replay state: unsupported version ${String(response.version)}`);
+  for (const key of ["api", "provider", "model"])
+    if (typeof response[key] !== "string" || response[key].length === 0)
+      throw new Error(`invalid pi-ai replay state: ${key} must be a non-empty string`);
+  if (!["stop", "length", "toolUse", "error", "aborted"].includes(String(response.stopReason)))
+    throw new Error("invalid pi-ai replay state: unknown stopReason");
+  if (!Array.isArray(value.blocks)) throw new Error("invalid pi-ai replay state: blocks must be an array");
+  for (const [index, block] of value.blocks.entries()) {
+    if (typeof block !== "object" || block === null || Array.isArray(block))
+      throw new Error(`invalid pi-ai replay state: block ${index} must be an object`);
+    if (!["text", "reasoning", "tool-call"].includes(String(block.type)))
+      throw new Error(`invalid pi-ai replay state: block ${index} has an unknown type`);
+    for (const signature of ["textSignature", "thinkingSignature", "thoughtSignature", "namespace"])
+      if (block[signature] !== undefined && typeof block[signature] !== "string")
+        throw new Error(`invalid pi-ai replay state: block ${index} ${signature} must be a string`);
+    if (block.redacted !== undefined && typeof block.redacted !== "boolean")
+      throw new Error(`invalid pi-ai replay state: block ${index} redacted must be boolean`);
+  }
+  return { response, blocks: value.blocks };
+}
+// The finish chunk from the tool-call stream must survive adapter validation.
+readReplayStateOrThrow(chunks[13].replayState);
+// replayedAssistant-style reconciliation: provider, model and one
+// type-matching block per durable content block must line up.
+{
+  const durableContent = [
+    { type: "reasoning", text: "Let me think." },
+    { type: "text", text: "Sure" },
+    { type: "tool-call", id: "call_1", name: "get_weather", arguments: '{"city":"Berlin"}' },
+  ];
+  const state = readReplayStateOrThrow(chunks[13].replayState);
+  assert.equal(state.response.provider, "sglang");
+  assert.equal(state.response.model, "Qwen3.8-27B");
+  assert.equal(state.blocks.length, durableContent.length, "block count must match assistant content");
+  for (const [index, block] of state.blocks.entries())
+    assert.equal(block.type, durableContent[index].type, `block ${index} type mismatch`);
+}
+// Regression guard: the old flat version-1 form must NOT pass validation
+// (this is the exact shape the adapter rejects with INVALID_REPLAY_STATE).
+assert.throws(
+  () =>
+    readReplayStateOrThrow({
+      kind: "pi-ai",
+      version: 1,
+      api: "openai-completions",
+      provider: "sglang",
+      model: "Qwen3.8-27B",
+      stopReason: "stop",
+      blocks: [{ type: "text" }],
+    }),
+  /expected a response object/,
+);
+// buildReplayState itself always emits the nested version-2 envelope,
+// including the reasoning → thinkingSignature and tool-call mappings.
+assert.deepEqual(
+  buildReplayState({
+    provider: "sglang",
+    model: "Qwen3.8-27B",
+    stopReason: "length",
+    blocks: [{ kind: "text" }, { kind: "reasoning", field: "reasoning_content" }, { kind: "tool-call" }],
+  }),
+  {
+    response: {
+      kind: "pi-ai",
+      version: 2,
+      api: "openai-completions",
+      provider: "sglang",
+      model: "Qwen3.8-27B",
+      stopReason: "length",
+    },
+    blocks: [
+      { type: "text" },
+      { type: "reasoning", thinkingSignature: "reasoning_content" },
+      { type: "tool-call" },
+    ],
+  },
+);
+// The mirror above and the production validator (lib/parity.js, the one the
+// direct route actually uses) must agree on every envelope shape: a drift
+// that only the mirror catches would silently degrade real sessions.
+{
+  const validResponse = chunks[13].replayState.response;
+  const rows = [
+    { value: chunks[13].replayState, ok: true },
+    { value: { kind: "pi-ai", version: 1, api: "openai-completions", provider: "sglang", model: "Qwen3.8-27B", stopReason: "stop", blocks: [] }, ok: false, re: /expected a response object/ },
+    { value: { response: { ...validResponse, version: 3 }, blocks: [] }, ok: false, re: /unsupported version 3/ },
+    { value: { response: { ...validResponse, stopReason: "nonsense" }, blocks: [] }, ok: false, re: /unknown stopReason/ },
+    { value: { response: validResponse, blocks: [{ type: "bogus" }] }, ok: false, re: /unknown type/ },
+    { value: { response: validResponse, blocks: [{ type: "reasoning", thinkingSignature: 42 }] }, ok: false, re: /thinkingSignature must be a string/ },
+    { value: { response: validResponse, blocks: [{ type: "text", redacted: "yes" }] }, ok: false, re: /redacted must be boolean/ },
+  ];
+  for (const row of rows) {
+    let mirror = "accept";
+    let production = "accept";
+    try {
+      readReplayStateOrThrow(row.value);
+    } catch (error) {
+      mirror = error.message;
+    }
+    try {
+      readPiAiReplayState(row.value);
+    } catch (error) {
+      production = error.message;
+    }
+    assert.equal(production, mirror, `validators diverge on ${JSON.stringify(row.value)}`);
+    if (row.ok) assert.equal(production, "accept");
+    else assert.match(production, row.re);
+  }
+}
 
 // ── case 2: mode 'on' → enable_thinking true, text response ───────────
 await setConfig({ mode: "on" });
@@ -581,8 +790,11 @@ assert.deepEqual(
   ["block-start", "reasoning-delta", "block-start", "text-delta", "block-end", "block-end", "usage", "finish"],
 );
 assert.deepEqual(chunks[7].reason, { kind: "stop" });
-assert.equal(chunks[7].replayState.stopReason, "stop");
-assert.deepEqual(chunks[7].replayState.blocks, [{ type: "reasoning" }, { type: "text" }]);
+assert.equal(chunks[7].replayState.response.stopReason, "stop");
+assert.deepEqual(chunks[7].replayState.blocks, [
+  { type: "reasoning", thinkingSignature: "reasoning_content" },
+  { type: "text" },
+]);
 assert.deepEqual(chunks[6].usage, { inputTokens: 10, outputTokens: 4 });
 
 // ── case 2b: mode 'on' + preserveThinking true → preserve_thinking true ──
@@ -652,7 +864,10 @@ const imageOptions = {
       source: { kind: "user" },
       content: [
         { type: "text", text: "what is this?" },
-        { type: "image", attachment: { id: "att_1" } },
+        {
+          type: "image",
+          attachment: { attachmentId: "att_1", name: "shot.png", mediaType: "image/png", width: 64, height: 64 },
+        },
       ],
     },
   ],
@@ -663,11 +878,20 @@ assert.equal(baseCalls, 1, "image requests fall through without the attachment s
 assert.equal(requests.length, 0);
 
 // ── case 8: image content WITH attachment service → direct route ──────
+const imageTargets = [];
 ctx.provide("attachments", {
-  readImage: async () => ({
-    data: Buffer.from("fakepngbytes"),
-    ref: { id: "att_1", mediaType: "image/png" },
-  }),
+  // Record the computed request target (asserted exactly in case 12) and
+  // echo it back, so the handle text reflects what the route requested.
+  readImageRequest: async (ref, target, signal) => {
+    imageTargets.push({ ref: ref.attachmentId, target });
+    return {
+      data: Buffer.from("fakepngbytes"),
+      mediaType: "image/png",
+      bytes: 12,
+      width: target.width,
+      height: target.height,
+    };
+  },
 });
 await setConfig({ mode: "off" });
 requests.length = 0;
@@ -679,8 +903,21 @@ assert.equal(requests.length, 1);
 const imageMsg = requests[0].body.messages.find((m) => Array.isArray(m.content));
 assert.ok(imageMsg, "multimodal user message present");
 assert.deepEqual(imageMsg.content[0], { type: "text", text: "what is this?" });
-assert.equal(imageMsg.content[1].type, "image_url");
-assert.ok(imageMsg.content[1].image_url.url.startsWith("data:image/png;base64,"));
+// Stock parity: every request image rides with a stable identity handle
+// (dsh-llm requestImageHandleText) ahead of the base64 payload.
+assert.equal(
+  imageMsg.content[1].text,
+  'Image "shot.png" (att_1); request preview 64x64px. It may be resized or re-encoded; ' +
+    "source dimensions, format, and byte size may differ.",
+);
+assert.equal(imageMsg.content[2].type, "image_url");
+assert.ok(imageMsg.content[2].image_url.url.startsWith("data:image/png;base64,"));
+// The route asked for exactly the source dimensions under the default
+// 4194304-px budget, with the default 1 MiB byte cap.
+assert.deepEqual(imageTargets.at(-1), {
+  ref: "att_1",
+  target: { width: 64, height: 64, maxBytes: 1048576 },
+});
 
 // ── case 9: reasoning_effort behavior matrix ───────────────────────────
 serverState.sse = SSE_TEXT;
@@ -888,11 +1125,14 @@ for (let t = 0; t < 6; t += 1) {
     source: { kind: "model", provider: "sglang", model: "Qwen3.8-27B" },
     content: [{ type: "tool-call", id: `call_r${t}`, name: "execute_shell_command", arguments: '{"command":"true"}' }],
   });
+  // The real harness appends each tool result as its own role-"tool" message.
   toolRunMessages.push({
-    id: `u${t}`,
-    role: "user",
+    id: `t${t}`,
+    role: "tool",
     source: { kind: "tool", callId: `call_r${t}` },
-    content: [{ type: "tool-result", toolCallId: `call_r${t}`, content: [{ type: "text", text: "ok" }] }],
+    toolCallId: `call_r${t}`,
+    isError: false,
+    content: [{ type: "text", text: "ok" }],
   });
 }
 toolRunMessages.push(...scaffoldTurns.map((turn, i) => ({ ...turn, id: `sc-run-${i}` })));
@@ -998,6 +1238,361 @@ for (const [eol, label] of [["\r\n", "CRLF"], ["\r", "lone-CR"]]) {
   assert.equal(out.adaptiveDecision.reason, "short-simple-message", `a ${label}-preceded scaffold marker must still be cut`);
   assert.equal(out.adaptiveDecision.on, false);
 }
+
+// ── case 11: stock-route parity edge shapes ────────────────────────────
+serverState.sse = SSE_TEXT;
+await setConfig({ mode: "off" });
+
+// 11a: history the direct mirror cannot reproduce (tool-change blocks) goes
+// back to the stock adapter BEFORE any HTTP request is issued.
+const toolChangeTurn = {
+  ...fakeOptions,
+  messages: [
+    { id: "tc1", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "add a tool" }] },
+    {
+      id: "tc2",
+      role: "user",
+      source: { kind: "tool-update" },
+      content: [{ type: "tool-addition", name: "extra", description: "x", parameters: { type: "object", properties: {} } }],
+    },
+  ],
+};
+requests.length = 0;
+baseCalls = 0;
+chunks = [...validateStream(await runWaterfall(toolChangeTurn))];
+assert.equal(baseCalls, 1, "tool-change history must use the stock route");
+assert.equal(requests.length, 0, "an unsupported history makes no direct request at all");
+
+// 11b: another provider's assistant turn degrades exactly like the adapter's
+// foreignAssistant view: thinking dropped, text and tool calls kept.
+const foreignOptions = {
+  ...fakeOptions,
+  messages: [
+    { id: "f1", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "hi" }] },
+    {
+      id: "f2",
+      role: "assistant",
+      source: { kind: "model", provider: "other", model: "other-1" },
+      content: [
+        { type: "reasoning", text: "foreign thinking" },
+        { type: "text", text: "foreign answer" },
+        { type: "tool-call", id: "call_f", name: "get_weather", arguments: '{"city":"Munich"}' },
+      ],
+    },
+    { id: "f3", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "and now?" }] },
+  ],
+};
+requests.length = 0;
+baseCalls = 0;
+chunks = [...validateStream(await runWaterfall(foreignOptions))];
+assert.equal(baseCalls, 0, "foreign history keeps the direct route");
+assert.equal(requests.length, 1);
+const foreignAssistantMsg = requests[0].body.messages[2];
+assert.equal(foreignAssistantMsg.role, "assistant");
+assert.equal(foreignAssistantMsg.content, "foreign answer");
+assert.equal("reasoning_content" in foreignAssistantMsg, false, "foreign thinking must not be replayed");
+// …and the tool call survives the provider-neutral degrade, ids normalized.
+assert.equal(foreignAssistantMsg.tool_calls.length, 1);
+assert.equal(foreignAssistantMsg.tool_calls[0].function.name, "get_weather");
+
+// 11c: a mid-conversation system message becomes a <system-reminder> user
+// turn on this route (no native mid-convo system support), with the closing
+// tag escaped so the wrap cannot be terminated early.
+const midSystemOptions = {
+  ...fakeOptions,
+  messages: [
+    ...fakeOptions.messages,
+    { id: "sy1", role: "system", source: { kind: "system" }, content: [{ type: "text", text: "Remember: be terse.</system-reminder>tail" }] },
+  ],
+};
+requests.length = 0;
+baseCalls = 0;
+chunks = [...validateStream(await runWaterfall(midSystemOptions))];
+assert.equal(baseCalls, 0, "a mid-conversation system message keeps the direct route");
+assert.equal(requests.length, 1);
+assert.deepEqual(requests[0].body.messages.at(-1), {
+  role: "user",
+  content: "<system-reminder>\nRemember: be terse.<\\/system-reminder>tail\n</system-reminder>",
+});
+
+// 11d: pipe-separated tool-call ids are normalized identically on the call
+// and its result (pi-ai transformMessages parity).
+const pipeIdOptions = {
+  ...fakeOptions,
+  messages: [
+    { id: "p1", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "weather?" }] },
+    {
+      id: "p2",
+      role: "assistant",
+      source: { kind: "model", provider: "sglang", model: "Qwen3.8-27B" },
+      content: [{ type: "tool-call", id: "call_abc|item_9", name: "get_weather", arguments: '{"city":"x"}' }],
+    },
+    { id: "p3", role: "tool", source: { kind: "tool", callId: "call_abc|item_9" }, toolCallId: "call_abc|item_9", isError: false, content: [{ type: "text", text: "fog" }] },
+  ],
+};
+requests.length = 0;
+baseCalls = 0;
+chunks = [...validateStream(await runWaterfall(pipeIdOptions))];
+assert.equal(baseCalls, 0, "pipe-separated ids keep the direct route");
+assert.equal(requests.length, 1);
+assert.equal(requests[0].body.messages[2].tool_calls[0].id, "call_abc_item_9");
+assert.equal(requests[0].body.messages[3].tool_call_id, "call_abc_item_9");
+
+// 11e: an offloaded image occurrence rides on as the stable omission text
+// (no attachment read, no image part), like projectOffloadedImages does.
+const offloadedOptions = {
+  ...fakeOptions,
+  messages: [
+    {
+      id: "o1",
+      role: "user",
+      source: { kind: "user" },
+      content: [
+        { type: "text", text: "the earlier screenshot" },
+        { type: "image", offloaded: true, attachment: { attachmentId: "att_old", name: "old.png", mediaType: "image/png", width: 10, height: 10 } },
+      ],
+    },
+  ],
+};
+requests.length = 0;
+baseCalls = 0;
+chunks = [...validateStream(await runWaterfall(offloadedOptions))];
+assert.equal(baseCalls, 0, "offloaded-only images keep the direct route");
+assert.equal(requests.length, 1);
+assert.equal(
+  requests[0].body.messages[1].content,
+  'the earlier screenshot[image omitted to fit request image limits; "old.png" (att_old). ' +
+    "No local normalized image path is available; ask the user to attach it again if needed.]",
+);
+
+// 11f: a legacy mixed user turn keeps block order — the user's own text
+// precedes the tool result riding in the same message.
+const legacyMixedOptions = {
+  ...fakeOptions,
+  messages: [
+    {
+      id: "l1",
+      role: "user",
+      source: { kind: "user" },
+      content: [
+        { type: "text", text: "look:" },
+        { type: "tool-result", toolCallId: "call_l", content: [{ type: "text", text: "sunny" }] },
+      ],
+    },
+  ],
+};
+requests.length = 0;
+baseCalls = 0;
+chunks = [...validateStream(await runWaterfall(legacyMixedOptions))];
+assert.equal(baseCalls, 0);
+assert.equal(requests.length, 1);
+assert.deepEqual(requests[0].body.messages.slice(1), [
+  { role: "user", content: "look:" },
+  { role: "tool", content: "sunny", tool_call_id: "call_l" },
+]);
+
+// ── case 12: compat resolution branches ────────────────────────────────
+// The other side of every flag the wire conversion reads. e2e route: a
+// profile whose compat overrides flip store/maxTokens/strict.
+serverState.sse = SSE_TEXT;
+await setConfig({ mode: "off" });
+requests.length = 0;
+baseCalls = 0;
+chunks = [...validateStream(await runWaterfall({ ...fakeOptions, provider: "overrides" }))];
+assert.equal(baseCalls, 0);
+assert.equal(requests.length, 1);
+assert.equal("store" in requests[0].body, false, "supportsStore false sends no store field");
+assert.equal(requests[0].body.max_tokens, 1000, "maxTokensField override respected");
+assert.equal("max_completion_tokens" in requests[0].body, false);
+assert.equal(requests[0].body.tools[0].function.strict, false, "supportsStrictMode true emits strict:false");
+
+// requestImagePixelBudget → readImageRequest target scaling: the 1024-px
+// budget shrinks the 64×64 source to a 32×32 request preview (the mock
+// echoes the computed target into the handle text).
+requests.length = 0;
+chunks = [...validateStream(await runWaterfall({ ...imageOptions, provider: "budgeted" }))];
+assert.equal(requests.length, 1);
+const budgetedMsg = requests[0].body.messages.find((m) => Array.isArray(m.content));
+assert.ok(budgetedMsg, "budgeted route still sends the multimodal message");
+assert.ok(
+  budgetedMsg.content[1].text.includes("request preview 32x32px"),
+  `expected downscaled preview, got: ${budgetedMsg.content[1].text}`,
+);
+assert.deepEqual(imageTargets.at(-1), {
+  ref: "att_1",
+  target: { width: 32, height: 32, maxBytes: 1048576 },
+});
+
+// Unit level: pi-ai detectCompat heuristics + override merge precedence.
+{
+  const ds = resolveCompletionsCompat({}, "deepseek-mirror", "https://api.deepseek.com/v1");
+  assert.equal(ds.supportsStore, false, "deepseek.com URL is non-standard (regression: URL match)");
+  assert.equal(ds.maxTokensField, "max_tokens");
+  assert.equal(ds.requiresReasoningContentOnAssistantMessages, true);
+  const merged = resolveCompletionsCompat(
+    { compat: { supportsStore: true, maxTokensField: "max_completion_tokens" } },
+    "deepseek",
+    "http://127.0.0.1:1/v1",
+  );
+  assert.equal(merged.supportsStore, true, "profile compat overrides win over detection");
+  assert.equal(merged.maxTokensField, "max_completion_tokens");
+  const plain = resolveCompletionsCompat({}, "sglang", "http://127.0.0.1:8070/v1");
+  assert.deepEqual(
+    { store: plain.supportsStore, max: plain.maxTokensField, strict: plain.supportsStrictMode },
+    { store: true, max: "max_completion_tokens", strict: false },
+    "plain local route detection (pinned e2e in case 1 too)",
+  );
+}
+
+// ── case 13: reasoning_details + id-normalization + access texts ───────
+serverState.sse = SSE_TEXT;
+await setConfig({ mode: "off" });
+
+// 13a: a JSON reasoning_details thinkingSignature replays as reasoning_details.
+const detailsSig = JSON.stringify([{ type: "reasoning.text", text: "hidden", format: "text", index: 0 }]);
+const detailsOptions = {
+  ...fakeOptions,
+  messages: [
+    { id: "rd1", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "hi" }] },
+    {
+      id: "rd2",
+      role: "assistant",
+      source: {
+        kind: "model",
+        provider: "sglang",
+        model: "Qwen3.8-27B",
+        replayState: {
+          response: {
+            kind: "pi-ai",
+            version: 2,
+            api: "openai-completions",
+            provider: "sglang",
+            model: "Qwen3.8-27B",
+            stopReason: "stop",
+          },
+          blocks: [{ type: "reasoning", thinkingSignature: detailsSig }, { type: "text" }],
+        },
+      },
+      content: [
+        { type: "reasoning", text: "hidden" },
+        { type: "text", text: "ok" },
+      ],
+    },
+  ],
+};
+requests.length = 0;
+baseCalls = 0;
+chunks = [...validateStream(await runWaterfall(detailsOptions))];
+assert.equal(requests.length, 1);
+const detailsAssistant = requests[0].body.messages[2];
+assert.deepEqual(detailsAssistant.reasoning_details, [{ type: "reasoning.text", text: "hidden", format: "text", index: 0 }]);
+assert.equal("reasoning_content" in detailsAssistant, false, "signed details replace the raw reasoning field");
+assert.equal(detailsAssistant.content, "ok");
+
+// 13b: tool-call id normalization arms pinned with literals computed from
+// pi-ai's own shortHash/normalizeToolCallId (openai-completions.js:865-888).
+assert.equal(
+  normalizeToolCallId("call_LONG_0123456789abcdefghij|item_0123456789abcdefghij", "sglang"),
+  "call_LONG_0123456789abcdefghij_o0i8c09b",
+  "hash-compaction arm (literal generated with @earendil-works/pi-ai shortHash)",
+);
+assert.equal(normalizeToolCallId("x".repeat(50), "openai"), "x".repeat(40), "openai 40-char truncation");
+assert.equal(normalizeToolCallId("x".repeat(50), "sglang"), "x".repeat(50), "non-openai providers keep long ids");
+
+// 13c: the normalized-copy access wording (currently never produced on the
+// wire) is pinned anyway, so the mirrored text can never drift untested.
+{
+  const ref = { attachmentId: "a7", name: "n.png", width: 8, height: 8, mediaType: "image/png" };
+  assert.equal(
+    requestImageHandleText(ref, { width: 4, height: 4 }, { readonlyPath: "/tmp/norm.png" }),
+    'Image "n.png" (a7); request preview 4x4px. Normalized copy (read-only; may be resized or ' +
+      're-encoded): "/tmp/norm.png" (8x8px, image/png). Source dimensions, format, and byte size ' +
+      "may differ. Copy to a writable path ending in .png before editing.",
+  );
+  assert.equal(
+    offloadedImageText(ref, { readonlyPath: "/tmp/norm.png" }),
+    '[image omitted to fit request image limits; "n.png" (a7). Normalized copy (read-only; may be ' +
+      'resized or re-encoded): "/tmp/norm.png" (8x8px, image/png). Source dimensions, format, and ' +
+      "byte size may differ. Copy to a writable path ending in .png before editing.]",
+  );
+  assert.throws(
+    () => requestImageHandleText(ref, { width: undefined, height: 4 }, undefined),
+    /no normalized dimensions/,
+  );
+}
+
+// ── case 14: the full compat flag surface on a fussy provider ──────────
+serverState.sse = SSE_TEXT;
+requests.length = 0;
+baseCalls = 0;
+// The assistant turn's replay state must be fussy-native: same provider and
+// model are what lets thinking survive the replay at all (11b pinned the
+// cross-provider drop already).
+const fussyOptions = {
+  ...fakeOptions,
+  provider: "fussy",
+  messages: [
+    { id: "fu1", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "weather in berlin?" }] },
+    {
+      id: "fu2",
+      role: "assistant",
+      source: {
+        kind: "model",
+        provider: "fussy",
+        model: "Qwen3.8-27B",
+        replayState: {
+          response: {
+            kind: "pi-ai",
+            version: 2,
+            api: "openai-completions",
+            provider: "fussy",
+            model: "Qwen3.8-27B",
+            stopReason: "toolUse",
+          },
+          blocks: [
+            { type: "text" },
+            { type: "reasoning", thinkingSignature: "reasoning_content" },
+            { type: "tool-call" },
+          ],
+        },
+      },
+      content: [
+        { type: "text", text: "Let me check." },
+        { type: "reasoning", text: "prior thinking" },
+        { type: "tool-call", id: "call_prev", name: "get_weather", arguments: '{"city":"Munich"}' },
+      ],
+    },
+    { id: "fu3", role: "tool", source: { kind: "tool", callId: "call_prev" }, toolCallId: "call_prev", isError: false, content: [{ type: "text", text: "sunny" }] },
+    { id: "fu4", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "now for Berlin" }] },
+  ],
+};
+chunks = [...validateStream(await runWaterfall(fussyOptions))];
+assert.equal(baseCalls, 0, "fussy flags must not force a stock fallback");
+assert.equal(requests.length, 1);
+const fussy = requests[0].body;
+// supportsDeveloperRole → head instruction uses the developer role.
+assert.equal(fussy.messages[0].role, "developer");
+// requiresThinkingAsText → thinking rides inside content as a text part;
+// requiresReasoningContentOnAssistantMessages seeds reasoning_content:""
+// (pi-ai seeds it whenever the field would be absent).
+assert.deepEqual(fussy.messages[2].content, [
+  { type: "text", text: "prior thinking" },
+  { type: "text", text: "Let me check." },
+]);
+assert.equal(fussy.messages[2].reasoning_content, "");
+// requiresToolResultName → the tool result carries the tool name.
+assert.equal(fussy.messages[3].name, "get_weather");
+// requiresAssistantAfterToolResult → the bridge turn before the next user.
+assert.deepEqual(fussy.messages[4], { role: "assistant", content: "I have processed the tool results." });
+assert.deepEqual(fussy.messages[5], { role: "user", content: "now for Berlin" });
+// pi-ai parity: request tools win when present…
+assert.equal(fussy.tools.length, 1);
+assert.equal(fussy.tools[0].function.name, "get_weather");
+// …and requiresToolsWithToolHistory emits `tools: []` for a tool-carrying
+// history once the request itself declares no tools.
+requests.length = 0;
+chunks = [...validateStream(await runWaterfall({ ...fussyOptions, tools: [] }))];
+assert.deepEqual(requests[0].body.tools, []);
 
 // ── write discipline ───────────────────────────────────────────────────
 assert.deepEqual(violations, [], "only volatile fields are ever written back");
