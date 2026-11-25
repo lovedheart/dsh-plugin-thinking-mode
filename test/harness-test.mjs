@@ -1263,6 +1263,37 @@ chunks = [...validateStream(await runWaterfall(toolChangeTurn))];
 assert.equal(baseCalls, 1, "tool-change history must use the stock route");
 assert.equal(requests.length, 0, "an unsupported history makes no direct request at all");
 
+// 11a′: a tool-change block in its legal developer role (what the host writes
+// when a tool is registered mid-session) is wire-cumulative and folds cleanly:
+// the block lives in a developer message with no text, so the mirror drops it
+// and keeps the direct route with thinking on. Before this it fell back to the
+// stock route permanently and the session never saw enable_thinking=true.
+const devToolAdditionTurn = {
+  ...fakeOptions,
+  messages: [
+    { id: "ta1", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "hello" }] },
+    {
+      id: "ta2",
+      role: "developer",
+      source: { kind: "tool-registry" },
+      content: [{ type: "tool-addition", toolName: "get_weather" }],
+    },
+    { id: "ta3", role: "user", source: { kind: "user" }, content: [{ type: "text", text: "weather?" }] },
+  ],
+};
+await setConfig({ mode: "on" });
+requests.length = 0;
+baseCalls = 0;
+chunks = [...validateStream(await runWaterfall(devToolAdditionTurn))];
+assert.equal(baseCalls, 0, "a developer-role tool-addition must keep the direct route");
+assert.equal(requests.length, 1, "the folded tool-addition must still issue a direct request");
+assert.equal(requests[0].body.chat_template_kwargs.enable_thinking, true, "direct route must force thinking on");
+assert.equal(
+  requests[0].body.messages.some((m) => m.content && String(m.content).includes("tool-addition")),
+  false,
+  "the tool-addition block must not leak onto the wire",
+);
+
 // 11b: another provider's assistant turn degrades exactly like the adapter's
 // foreignAssistant view: thinking dropped, text and tool calls kept.
 const foreignOptions = {
